@@ -12,6 +12,8 @@ from awiki_open_server.app.settings import Settings, load_settings
 from awiki_open_server.service_identity import service_identity_from_settings
 from awiki_open_server.messaging.groups.outbox import run_group_outbox
 from awiki_open_server.storage.db import Store
+from awiki_open_server.messaging.standard_sync import load_or_create_page_ref_key
+from awiki_open_server.user_compat.device_auth import load_token_signing_key
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -36,6 +38,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Awiki Open Server", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.store = store
+    app.state.auth_token_signing_key = load_token_signing_key(settings.data_dir, settings.service_private_key_pem)
+    app.state.snapshot_page_ref_key = load_or_create_page_ref_key(settings.data_dir)
     app.state.realtime_hub = RealtimeHub()
     app.state.group_outbox_lock = threading.Lock()
     app.state.group_outbox_last_heartbeat = None

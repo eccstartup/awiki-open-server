@@ -4,6 +4,7 @@ import base64
 import copy
 from datetime import datetime, timezone
 import hashlib
+import json
 import time
 import urllib.parse
 
@@ -22,7 +23,8 @@ async def register(client, handle: str):
 
 async def register_with_key(client, handle: str):
     did = f"did:wba:testserver:users:{handle}:e1_default"
-    private_key, document = did_keypair_document(did)
+    private_key, document = bound_did_keypair_document(did)
+    did = document["id"]
     document["service"][0]["serviceEndpoint"] = "http://testserver/anp-im/rpc"
     document["service"][0]["serviceDid"] = "did:wba:testserver"
     document = sign_did_document(document, private_key)
@@ -88,21 +90,68 @@ def did_keypair_document(did: str) -> tuple[ed25519.Ed25519PrivateKey, dict]:
                 "type": "ANPMessageService",
                 "serviceEndpoint": "https://awiki.info/anp-im/rpc",
                 "serviceDid": "did:wba:awiki.info",
-                "profiles": ["anp.direct.base.v1"],
+                "profiles": ["anp.direct.base.v1", "anp.group.base.v1", "anp.group.base.v2"],
                 "securityProfiles": ["transport-protected"],
             }
         ],
     }
 
 
-def origin_proof(meta: dict, body: dict, private_key: ed25519.Ed25519PrivateKey | None = None, method: str = "direct.send") -> dict:
+def bound_did_keypair_document(did: str) -> tuple[ed25519.Ed25519PrivateKey, dict]:
+    from awiki_open_server.protocol.anp_adapter import ed25519_root_fingerprint
+
+    private_key, document = did_keypair_document(did)
+    bound_did = f"{did.rsplit(':', 1)[0]}:e1_{ed25519_root_fingerprint(private_key.public_key())}"
+    return private_key, json.loads(json.dumps(document).replace(did, bound_did))
+
+
+def single_device_document(did: str, *, device_id: str = "device-primary", root_key=None) -> tuple:
+    """Build distinct root/device keys for registration, without encrypted traffic."""
+    from anp.authentication.device_manifest import DeviceManifestEntry, build_vnext_did_document
+    from anp.authentication.did_wba import compute_multikey_fingerprint
+    from cryptography.hazmat.primitives.asymmetric import x25519
+
+    root, document = did_keypair_document(did)
+    root = root_key or root
+    did = f"{did.rsplit(':', 1)[0]}:e1_{compute_multikey_fingerprint(root.public_key())}"
+    document["service"][0]["id"] = f"{did}#anp-message"
+    document["verificationMethod"][0].update(
+        id=f"{did}#key-1", controller=did, publicKeyMultibase=_multikey(root.public_key()),
+    )
+    signing = ed25519.Ed25519PrivateKey.generate()
+    agreement = x25519.X25519PrivateKey.generate()
+    signing_id = f"{did}#{device_id}-sign"
+    agreement_id = f"{did}#{device_id}-agreement"
+    entry = DeviceManifestEntry(
+        device_id=device_id,
+        signing_key_id=signing_id,
+        e2ee_key_id=agreement_id,
+        profiles=("anp.core.binding.v1", "anp.identity.discovery.v1", "anp.direct.base.v1", "anp.group.base.v1"),
+    )
+    document = build_vnext_did_document(
+        {"id": did, "service": document["service"]},
+        f"{did}#key-1",
+        document["verificationMethod"][0],
+        entry,
+        {"id": signing_id, "type": "Multikey", "controller": did, "publicKeyMultibase": _multikey(signing.public_key())},
+        {
+            "id": agreement_id,
+            "type": "JsonWebKey2020",
+            "controller": did,
+            "publicKeyJwk": {"kty": "OKP", "crv": "X25519", "x": _b64u(agreement.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))},
+        },
+    )
+    return root, signing, document
+
+
+def origin_proof(meta: dict, body: dict, private_key: ed25519.Ed25519PrivateKey | None = None, method: str = "direct.send", *, created: int | None = None, ttl_seconds: int = 300) -> dict:
     private_key = private_key or ed25519.Ed25519PrivateKey.generate()
     key_id = f"{meta['sender_did']}#key-1"
     digest = content_digest(jcs.canonicalize({"method": method, "meta": meta, "body": body}))
-    created = int(time.time())
+    created = int(time.time()) if created is None else created
     signature_input = (
         'sig1=("@method" "@target-uri" "content-digest");'
-        f'created={created};expires={created + 300};keyid="{key_id}"'
+        f'created={created};expires={created + ttl_seconds};keyid="{key_id}"'
     )
     target = meta["target"]
     proof_base = "\n".join(
@@ -146,6 +195,7 @@ def runtime_capabilities(service_did: str) -> dict:
                 "anp.identity.discovery.v1",
                 "anp.direct.base.v1",
                 "anp.group.base.v1",
+                "anp.group.base.v2",
                 "anp.attachment.v1",
                 "anp.federation.relay.v1",
             ],

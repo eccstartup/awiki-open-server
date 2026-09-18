@@ -62,6 +62,7 @@ def generate_group_identity(
     group_id: str,
     service_endpoint: str,
     service_did: str,
+    profile: str = "anp.group.base.v1",
 ) -> tuple[dict[str, Any], str]:
     try:
         return create_group_did_identity(
@@ -69,6 +70,7 @@ def generate_group_identity(
             group_id=group_id,
             service_endpoint=service_endpoint,
             service_did=service_did,
+            profile=profile,
         )
     except AnpProtocolError as exc:
         raise InvalidParams(exc.code, data={"detail": exc.detail}) from exc

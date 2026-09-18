@@ -50,7 +50,15 @@ async def test_attachment_canonical_b64u_digest_and_commit_shape(client):
         token=token,
     )
     slot_result = slot["result"]
-    assert slot_result["expected_digest"] == {"alg": "sha-256", "value_b64u": digest_b64u}
+    assert set(slot_result) == {
+        "attachment_id",
+        "slot_id",
+        "upload_uri",
+        "upload_headers",
+        "object_uri",
+        "commit_token",
+        "expires_at",
+    }
     await client.put(
         f"/objects/upload/{slot_result['slot_id']}",
         headers=slot_result["upload_headers"],
@@ -79,7 +87,13 @@ async def test_attachment_canonical_b64u_digest_and_commit_shape(client):
         },
         token=token,
     )
-    assert committed["result"]["digest"] == {"alg": "sha-256", "value_b64u": digest_b64u}
+    assert set(committed["result"]) == {
+        "committed",
+        "attachment_id",
+        "object_uri",
+        "committed_at",
+    }
+    assert committed["result"]["committed"] is True
 
 @pytest.mark.asyncio
 async def test_attachment_roundtrip(client):
@@ -396,11 +410,14 @@ async def test_attachment_download_ticket_accepts_anp_body_shape(client):
         "one_time": True,
     }
     direct_ticket = await rpc(client, "/im/rpc", "attachment.get_download_ticket", {"meta": ticket_meta, "body": ticket_body}, token=recipient_token)
-    assert direct_ticket["result"]["download_ticket_b64u"] == direct_ticket["result"]["ticket"]
+    assert set(direct_ticket["result"]) == {
+        "download_ticket_b64u",
+        "expires_at",
+        "ticket_binding",
+    }
     assert direct_ticket["result"]["ticket_binding"] == {
         "attachment_id": "att-direct",
         "object_uri": object_uri,
-        "sender_did": sender_did,
         "requester_did": recipient_did,
         "message_id": "msg-att-direct",
         "message_security_profile": "transport-protected",

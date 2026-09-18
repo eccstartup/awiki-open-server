@@ -5,6 +5,24 @@ import pytest
 from tests.conftest import rpc
 
 @pytest.mark.asyncio
+async def test_agent_exchange_cannot_overwrite_registered_identity(client):
+    owner = (await rpc(client, "/did-auth/rpc", "register", {"handle": "exchange-owner"}))["result"]
+    victim = (await rpc(client, "/did-auth/rpc", "register", {"handle": "exchange-victim"}))["result"]
+    issued = (await rpc(client, "/user-service/agent-registration/rpc", "issue_token", token=owner["token"]))["result"]
+    before = await rpc(client, "/user-service/did-auth/rpc", "get_me", token=victim["token"])
+    rejected = await rpc(client, "/user-service/agent-registration/rpc", "exchange_token", {
+        "token": issued["token"], "agent_did": victim["did"],
+        "did_document": {"id": victim["did"], "service": []},
+    })
+    assert rejected["error"]["message"] == "did_document_already_registered"
+    after = await rpc(client, "/user-service/did-auth/rpc", "get_me", token=victim["token"])
+    assert "result" in before and "result" in after
+    assert after["result"]["did_document"] == before["result"]["did_document"]
+    assert after["result"]["document_version"] == before["result"]["document_version"]
+    remaining = await rpc(client, "/user-service/agent-registration/rpc", "verify_token", {"token": issued["token"]})
+    assert remaining["result"]["active"] is True
+
+@pytest.mark.asyncio
 async def test_agent_registration_and_message_agent_minimal_compat(client):
     registered = await rpc(client, "/did-auth/rpc", "register", {"handle": "agent-owner"})
     owner_token = registered["result"]["token"]
@@ -206,4 +224,3 @@ async def test_agent_inventory_minimal_compat_routes(client):
 
     inactive_list = await rpc(client, "/user-service/agent-inventory/rpc", "list_agents", {"include_inactive": True}, token=owner_token)
     assert inactive_list["result"]["count"] == 1
-

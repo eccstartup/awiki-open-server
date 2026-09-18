@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -31,6 +32,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.x509.oid import NameOID
 
 from awiki_open_server.service_identity import content_digest, generate_ed25519_private_key_pem
+from awiki_open_server.protocol.anp_adapter import ed25519_root_fingerprint
 
 
 def open_server_provenance() -> dict[str, Any]:
@@ -367,6 +369,35 @@ def start_rust_cli_listener(cli_bin: str, workspace: Path, home: Path) -> subpro
     )
 
 
+def _safe_cli_diagnostic(args: tuple[str, ...], output: str = "") -> dict[str, Any]:
+    sensitive = {"--phone", "--otp", "--token", "--access-token", "--password"}
+    shown = ["[redacted]" if index and args[index - 1] in sensitive else value for index, value in enumerate(args)]
+    shown = [value.split("=", 1)[0] + "=[redacted]" if "=" in value and value.split("=", 1)[0] in sensitive else value for value in shown]
+    def scrub(value):
+        if isinstance(value, dict):
+            return {key: "[redacted]" if any(part in key.lower() for part in ("token", "password", "secret", "private", "authorization", "cookie", "phone", "otp")) else scrub(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if isinstance(value, str):
+            if "-----BEGIN" in value:
+                return "[redacted key material]"
+            value = re.sub(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+", "[redacted token]", value)
+            value = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[redacted phone]", value)
+            for index, argument in enumerate(args):
+                if index and args[index - 1] in sensitive and argument:
+                    value = value.replace(argument, "[redacted]")
+            return value
+        return value
+    result = {"args": shown}
+    try:
+        result["response"] = scrub(json.loads(output))
+    except json.JSONDecodeError:
+        # A crashed process may dump arbitrary credentials; keep its identity,
+        # not an unstructured stdout/stderr tail, in the public failure record.
+        result["non_json_output_bytes"] = len(output.encode())
+    return result
+
+
 def rust_cli_json(cli_bin: str, workspace: Path, home: Path, *args: str) -> dict[str, Any]:
     env = rust_cli_env(workspace, home)
     completed = subprocess.run(
@@ -381,10 +412,9 @@ def rust_cli_json(cli_bin: str, workspace: Path, home: Path, *args: str) -> dict
             "rust cli command failed: "
             + json.dumps(
                 {
-                    "args": list(args),
+                    **_safe_cli_diagnostic(args, completed.stdout),
                     "returncode": completed.returncode,
-                    "stdout": completed.stdout[-2000:],
-                    "stderr": completed.stderr[-2000:],
+                    "stderr": _safe_cli_diagnostic(args, completed.stderr),
                 },
                 ensure_ascii=False,
             )
@@ -394,12 +424,12 @@ def rust_cli_json(cli_bin: str, workspace: Path, home: Path, *args: str) -> dict
     except json.JSONDecodeError as exc:
         raise RuntimeError(
             "rust cli command returned non-json output: "
-            + json.dumps({"args": list(args), "stdout": completed.stdout[-2000:]}, ensure_ascii=False)
+            + json.dumps(_safe_cli_diagnostic(args, completed.stdout), ensure_ascii=False)
         ) from exc
     if parsed.get("ok") is not True:
         raise RuntimeError(
             "rust cli command returned ok=false: "
-            + json.dumps({"args": list(args), "response": parsed}, ensure_ascii=False)
+            + json.dumps(_safe_cli_diagnostic(args, completed.stdout), ensure_ascii=False)
         )
     return parsed
 
@@ -613,10 +643,6 @@ def assert_rust_cli_fails(
         )
 
 
-def china_dev_phone() -> str:
-    return f"138{uuid.uuid4().int % 100000000:08d}"
-
-
 def smoke_rust_cli_local(args: argparse.Namespace) -> int:
     if args.standard_https and not args.inside_netns:
         unshare = shutil.which("unshare")
@@ -737,10 +763,7 @@ def smoke_rust_cli_local(args: argparse.Namespace) -> int:
             "register",
             "--handle",
             alice_handle,
-            "--phone",
-            china_dev_phone(),
-            "--otp",
-            "123456",
+            "--community",
         )
         bob_register = rust_cli_json(
             cli_bin,
@@ -750,10 +773,7 @@ def smoke_rust_cli_local(args: argparse.Namespace) -> int:
             "register",
             "--handle",
             bob_handle,
-            "--phone",
-            china_dev_phone(),
-            "--otp",
-            "123456",
+            "--community",
         )
         charlie_register = rust_cli_json(
             cli_bin,
@@ -763,10 +783,7 @@ def smoke_rust_cli_local(args: argparse.Namespace) -> int:
             "register",
             "--handle",
             charlie_handle,
-            "--phone",
-            china_dev_phone(),
-            "--otp",
-            "123456",
+            "--community",
         )
         alice_did = rust_register_did(alice_register)
         bob_did = rust_register_did(bob_register)
@@ -1388,13 +1405,13 @@ def smoke_rust_cli_realtime_restart(args: argparse.Namespace) -> int:
         alice_did = rust_register_did(
             rust_cli_json(
                 cli_bin, alice_workspace, home, "id", "register", "--handle", alice_handle,
-                "--phone", china_dev_phone(), "--otp", "123456",
+                "--community",
             )
         )
         bob_did = rust_register_did(
             rust_cli_json(
                 cli_bin, bob_workspace, home, "id", "register", "--handle", bob_handle,
-                "--phone", china_dev_phone(), "--otp", "123456",
+                "--community",
             )
         )
         created_group = rust_cli_json(
@@ -1616,11 +1633,11 @@ def smoke_rust_cli_cross_domain(args: argparse.Namespace) -> int:
         bob_handle = unique_handle("cross-bob")
         alice_did = rust_register_did(rust_cli_json(
             cli_bin, alice_workspace, home, "id", "register", "--handle", alice_handle,
-            "--phone", china_dev_phone(), "--otp", "123456",
+            "--community",
         ))
         bob_did = rust_register_did(rust_cli_json(
             cli_bin, bob_workspace, home, "id", "register", "--handle", bob_handle,
-            "--phone", china_dev_phone(), "--otp", "123456",
+            "--community",
         ))
         # Establish each single-device Sync v2 binding before creating remote
         # events so the test exercises delta delivery rather than a late first
@@ -1780,10 +1797,7 @@ def smoke_rust_cli_connect(args: argparse.Namespace) -> int:
             "register",
             "--handle",
             unique_handle(f"{prefix}-alice"),
-            "--phone",
-            china_dev_phone(),
-            "--otp",
-            "123456",
+            "--community",
         )
         bob_register = rust_cli_json(
             cli_bin,
@@ -1793,10 +1807,7 @@ def smoke_rust_cli_connect(args: argparse.Namespace) -> int:
             "register",
             "--handle",
             unique_handle(f"{prefix}-bob"),
-            "--phone",
-            china_dev_phone(),
-            "--otp",
-            "123456",
+            "--community",
         )
         alice_did = rust_register_did(alice_register)
         bob_did = rust_register_did(bob_register)
@@ -1927,8 +1938,8 @@ def smoke_cross_domain_local(args: argparse.Namespace) -> int:
         target_user_key = ed25519.Ed25519PrivateKey.generate()
         source_handle = unique_handle(args.source_handle)
         target_handle = unique_handle(args.target_handle)
-        source_did = f"did:wba:{source_domain}:users:{source_handle}:e1_default"
-        target_did = f"did:wba:{target_domain}:users:{target_handle}:e1_default"
+        source_did = f"did:wba:{source_domain}:users:{source_handle}:e1_{ed25519_root_fingerprint(source_user_key.public_key())}"
+        target_did = f"did:wba:{target_domain}:users:{target_handle}:e1_{ed25519_root_fingerprint(target_user_key.public_key())}"
         source_user = rpc(
             source_base,
             "/did-auth/rpc",

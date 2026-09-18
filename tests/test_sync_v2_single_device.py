@@ -3,23 +3,16 @@ from __future__ import annotations
 import pytest
 
 from tests.conftest import rpc
-from tests.helpers import did_keypair_document, origin_proof, register, sign_did_document
+from tests.helpers import did_keypair_document, origin_proof, register, sign_did_document, single_device_document
 
 
 async def _register_single_device(client, handle: str, *, device_id: str = "device-primary"):
     did = f"did:wba:testserver:user:{handle}:e1_device"
-    private_key, document = did_keypair_document(did)
+    private_key, _, document = single_device_document(did, device_id=device_id)
+    did = document["id"]
     document["service"][0].update(
         {"serviceEndpoint": "http://testserver/anp-im/rpc", "serviceDid": "did:wba:testserver"}
     )
-    document["deviceManifest"] = {
-        "devices": [
-            {
-                "device_id": device_id,
-                "signing_key_id": f"{did}#key-1",
-            }
-        ]
-    }
     document = sign_did_document(document, private_key)
     response = await rpc(
         client,
@@ -72,7 +65,9 @@ async def test_sync_v2_single_device_bootstrap_delta_and_hydration(client):
     result = capabilities["result"]
     assert "anp.sync.local.v2" in result["profiles"]
     assert result["disabled_features"]["multi_device"] == "not_supported"
-    assert result["disabled_features"]["sync_v2_mode"] == "single_device_pull_only"
+    assert result["disabled_features"]["sync_v2_mode"] == "standard_explicit_negotiation"
+    assert "awiki.message-sync.explicit-negotiation.v1" in result["supported_profiles"]
+    assert "sync.snapshot_paging.v1" in result["supported_profiles"]
     assert result["features"]["methods"]["sync.delta"]["profiles"] == [
         "anp.sync.local.v1",
         "anp.sync.local.v2",
@@ -130,7 +125,8 @@ async def test_sync_v2_single_device_bootstrap_delta_and_hydration(client):
     assert event["recipient_device_id"] is None
     assert event["payload"]["message_kind"] == "direct_plain"
     assert event["payload"]["direction"] == "incoming"
-    assert event["thread_key"] == f"direct:{peer}"
+    assert event["thread_key"].startswith("conv_")
+    assert peer not in event["thread_key"]
 
     batch = await rpc(
         client,
@@ -365,7 +361,7 @@ async def test_sync_v2_group_delta_batch_and_thread_after(client):
         _v2_params(
             owner,
             "op-sync-v2-group-thread-second",
-            {"thread_key": f"group:{group_did}", "after_server_seq": first_seq, "limit": 10},
+            {"thread_key": group_did, "after_server_seq": first_seq, "limit": 10},
         ),
         token=owner_token,
     )

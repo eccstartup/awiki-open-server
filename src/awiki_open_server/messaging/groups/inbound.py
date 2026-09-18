@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime, timezone, timedelta
 from typing import Any
+
+from awiki_open_server.messaging.groups.protocol import BASE_PROFILES, BASE_V2, discovered_group_profile, validate_v2_shape
 
 import jcs
 from fastapi import Request
@@ -38,8 +42,9 @@ def _notification_context(params: dict[str, Any], request: Request, method: str)
     body = params.get("_anp_body")
     if not isinstance(meta, dict) or not isinstance(body, dict):
         raise InvalidParams("group.notification_envelope_required")
-    if meta.get("profile") != "anp.group.base.v1" or meta.get("security_profile") != "transport-protected":
+    if meta.get("profile") not in BASE_PROFILES or meta.get("security_profile") != "transport-protected":
         raise InvalidParams("group.notification_profile_invalid")
+    validate_v2_shape(method, meta, body)
     target = meta.get("target")
     if not isinstance(target, dict) or target.get("kind") != "agent":
         raise InvalidParams("group.notification_target_invalid")
@@ -53,6 +58,9 @@ def _notification_context(params: dict[str, Any], request: Request, method: str)
         get_settings(request),
         caller_anchor=group_did,
     )
+    service = runtime._discover_anp_service(group_did, get_settings(request))
+    if discovered_group_profile(service) != meta["profile"]:
+        raise InvalidParams("group.notification_profile_mismatch")
     if method == "group.state_changed" and meta.get("sender_did") != group_did:
         raise Unauthorized("group.state_changed_sender_mismatch")
     return meta, body, target_did, group_did
@@ -122,17 +130,27 @@ def _record_inbound(
     return True
 
 
+def _covered_by_observation(view, request, event_seq: int, state_version: int) -> bool:
+    return bool(view and view["host_service_did"] == runtime._verified_peer_service_did(request)
+                and 0 < event_seq <= int(view["observed_event_seq"])
+                and 0 < state_version <= int(view["observed_state_version"]))
+
+
 def group_state_changed(params: dict[str, Any], request: Request) -> dict[str, Any]:
     meta, event, target_did, group_did = _notification_context(params, request, "group.state_changed")
     receipt, state_version, event_seq = _verified_receipt(request, event, method="group.state_changed")
     event_type = _require_string(event.get("event_type"), "group.event_type_required")
     changed_at = _require_string(event.get("changed_at"), "group.changed_at_required")
     with get_store(request).connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
             "SELECT * FROM group_views WHERE owner_did = ? AND group_did = ?",
             (target_did, group_did),
         ).fetchone()
-        if existing and event_seq > int(existing["group_event_seq"]) + 1:
+        reactivated = bool(meta["profile"] == BASE_V2 and existing and existing["membership_status"] != "active"
+                           and event_type == "member-activated" and event.get("subject_did") == target_did
+                           and event.get("membership_status") == "active" and state_version > int(existing["group_state_version"]))
+        if existing and event_seq > int(existing["group_event_seq"]) + 1 and not reactivated:
             raise Conflict("group.projection_gap")
         if not existing and not (
             event_type == "member-activated"
@@ -151,11 +169,23 @@ def group_state_changed(params: dict[str, Any], request: Request) -> dict[str, A
         ):
             return {"accepted": True, "duplicate": True}
         if existing and event_seq <= int(existing["group_event_seq"]):
-            raise Conflict("group.projection_stale_event")
+            if _covered_by_observation(existing, request, event_seq, state_version):
+                # The roster read already installed a newer authenticated view.
+                # Consume this notification without restoring older state.
+                return {"accepted": True, "superseded": True}
+            if not _matches_forwarded_terminal(conn, meta, event, receipt, target_did, group_did):
+                raise Conflict("group.projection_stale_event")
+            if event_seq < int(existing["group_event_seq"]):
+                return {"accepted": True, "duplicate": True}
         profile = event.get("group_profile") if isinstance(event.get("group_profile"), dict) else (json.loads(existing["profile_json"]) if existing else {})
         policy = event.get("group_policy") if isinstance(event.get("group_policy"), dict) else (json.loads(existing["policy_json"]) if existing else {})
         member_role = str(existing["member_role"]) if existing else str(event.get("role") or "member")
         membership_status = str(existing["membership_status"]) if existing else "active"
+        if reactivated:
+            membership_status = "active"
+            member_role = str(event.get("role") or "member")
+        if event.get("subject_did") == target_did and event_type in {"member-removed", "member-left"}:
+            membership_status = "removed" if event_type == "member-removed" else "left"
         conn.execute(
             """
             INSERT INTO group_views(
@@ -165,12 +195,13 @@ def group_state_changed(params: dict[str, Any], request: Request) -> dict[str, A
             ON CONFLICT(owner_did, group_did) DO UPDATE SET
               profile_json = excluded.profile_json, policy_json = excluded.policy_json,
               group_state_version = excluded.group_state_version,
-              group_event_seq = excluded.group_event_seq, updated_at = excluded.updated_at
+              group_event_seq = excluded.group_event_seq, updated_at = excluded.updated_at,
+              membership_status = excluded.membership_status, member_role = excluded.member_role
             """,
             (
                 target_did,
                 group_did,
-                runtime._source_service_did(dict(request.headers)),
+                runtime._verified_peer_service_did(request),
                 _json(profile),
                 _json(policy),
                 state_version,
@@ -180,6 +211,7 @@ def group_state_changed(params: dict[str, Any], request: Request) -> dict[str, A
                 changed_at,
             ),
         )
+        conn.execute("UPDATE group_views SET wire_profile = ? WHERE owner_did = ? AND group_did = ?", (meta["profile"], target_did, group_did))
         subject_did = event.get("subject_did")
         if isinstance(subject_did, str):
             conn.execute(
@@ -216,6 +248,69 @@ def group_state_changed(params: dict[str, Any], request: Request) -> dict[str, A
     return {"accepted": True, "group_did": group_did, "group_event_seq": str(event_seq), "group_receipt": receipt}
 
 
+def _matches_forwarded_terminal(conn, meta, event, receipt, target_did, group_did) -> bool:
+    """Match an already authenticated Host response, never just its sequence."""
+    if meta.get("profile") != BASE_V2 or event.get("subject_did") != target_did:
+        return False
+    method = receipt.get("subject_method")
+    terminal = {"group.leave": ("member-left", "left", "leaver_did"),
+                "group.remove": ("member-removed", "removed", "member_did")}.get(method)
+    if terminal is None or event.get("event_type") != terminal[0] or event.get("membership_status") != terminal[1]:
+        return False
+    row = conn.execute(
+        "SELECT result_json FROM group_operations WHERE sender_did=? AND group_scope=? AND method=? AND operation_id=? AND wire_profile=? AND payload_digest=?",
+        (receipt.get("actor_did"), group_did, method, receipt.get("operation_id"), BASE_V2, receipt.get("payload_digest")),
+    ).fetchone()
+    if row is None:
+        return False
+    result = json.loads(row["result_json"])
+    return result.get(terminal[2]) == target_did and result.get("group_receipt") == receipt
+
+
+def _accepted_before_terminal(conn, view, meta, receipt, target_did, group_did, event_seq, state_version) -> bool:
+    """Retain an in-flight message accepted during this membership interval.
+
+    The current ACL stays terminal; only a known signed terminal response and
+    an earlier authenticated activation establish the allowed interval.
+    """
+    if meta["profile"] != BASE_V2 or view["membership_status"] not in {"left", "removed"}:
+        return False
+    if event_seq >= int(view["group_event_seq"]) or state_version >= int(view["group_state_version"]):
+        return False
+    activation = conn.execute(
+        """SELECT payload_json FROM sync_events WHERE owner_did=? AND event_type='group.state_changed'
+           AND json_extract(payload_json,'$.group_did')=? AND json_extract(payload_json,'$.subject_did')=?
+           AND json_extract(payload_json,'$.event_type') IN ('member-activated','member-rebound')
+           AND json_extract(payload_json,'$.membership_status')='active' ORDER BY event_seq DESC LIMIT 1""",
+        (target_did, group_did, target_did),
+    ).fetchone()
+    if activation is None or event_seq <= int(json.loads(activation["payload_json"])["group_event_seq"]):
+        return False
+    method, target_key = ("group.leave", "leaver_did") if view["membership_status"] == "left" else ("group.remove", "member_did")
+    rows = conn.execute("SELECT result_json FROM group_operations WHERE group_scope=? AND method=? AND wire_profile=?", (group_did, method, BASE_V2)).fetchall()
+    for row in rows:
+        result = json.loads(row["result_json"])
+        terminal = result.get("group_receipt", {})
+        if (result.get(target_key) == target_did and terminal.get("group_event_seq") == str(view["group_event_seq"])
+                and terminal.get("group_state_version") == str(view["group_state_version"])):
+            return True
+    return False
+
+
+def verified_acceptance_time(receipt: dict[str, Any], body: dict[str, Any]) -> datetime:
+    """Use only after the Group Receipt signature/context has been verified."""
+    value = receipt.get("accepted_at")
+    if not isinstance(value, str) or value != body.get("accepted_at") or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})", value):
+        raise InvalidParams("group.invalid_group_receipt")
+    try:
+        accepted = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise InvalidParams("group.invalid_group_receipt") from exc
+    if accepted > datetime.now(timezone.utc) + timedelta(seconds=60):
+        raise InvalidParams("group.invalid_group_receipt")
+    return accepted
+
+
 def group_incoming(params: dict[str, Any], request: Request) -> dict[str, Any]:
     meta, body, target_did, group_did = _notification_context(params, request, "group.incoming")
     message_id = _require_string(meta.get("message_id"), "anp_meta_message_id_required")
@@ -224,6 +319,9 @@ def group_incoming(params: dict[str, Any], request: Request) -> dict[str, Any]:
     sender_did = _require_string(meta.get("sender_did"), "anp_meta_sender_did_required")
     body_with_message = {**body, "message_id": message_id}
     receipt, state_version, event_seq = _verified_receipt(request, body_with_message, method="group.incoming")
+    if receipt.get("actor_did") != sender_did or receipt.get("operation_id") != operation_id:
+        raise InvalidParams("group.invalid_group_receipt")
+    accepted_at = verified_acceptance_time(receipt, body)
     original_body = {key: value for key, value in body.items() if key not in _INCOMING_CONTROL_FIELDS}
     original_meta = {**meta, "target": {"kind": "group", "did": group_did}}
     auth = params.get("_anp_auth") if isinstance(params.get("_anp_auth"), dict) else None
@@ -236,16 +334,21 @@ def group_incoming(params: dict[str, Any], request: Request) -> dict[str, Any]:
         meta=original_meta,
         body=original_body,
         sender_did_document=runtime._resolve_did_document_for_proof(request, sender_did),
+        verified_at=accepted_at,
     )
     with get_store(request).connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         view = conn.execute(
             """
             SELECT * FROM group_views
-            WHERE owner_did = ? AND group_did = ? AND membership_status = 'active'
+            WHERE owner_did = ? AND group_did = ?
             """,
             (target_did, group_did),
         ).fetchone()
         if not view:
+            raise Unauthorized("group.projection_membership_required")
+        before_terminal = _accepted_before_terminal(conn, view, meta, receipt, target_did, group_did, event_seq, state_version)
+        if view["membership_status"] != "active" and not before_terminal:
             raise Unauthorized("group.projection_membership_required")
         if event_seq > int(view["group_event_seq"]) + 1:
             raise Conflict("group.projection_gap")
@@ -259,14 +362,14 @@ def group_incoming(params: dict[str, Any], request: Request) -> dict[str, Any]:
             body=body,
         ):
             return {"accepted": True, "duplicate": True}
-        if event_seq <= int(view["group_event_seq"]):
+        if event_seq <= int(view["group_event_seq"]) and not before_terminal and not _covered_by_observation(view, request, event_seq, state_version):
             raise Conflict("group.projection_stale_event")
         conn.execute(
             """
             INSERT INTO group_message_views(
               owner_did, group_did, message_id, group_event_seq, group_state_version,
-              sender_did, operation_id, content_type, body_json, receipt_json, accepted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              sender_did, operation_id, content_type, body_json, receipt_json, accepted_at, wire_profile
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 target_did,
@@ -280,14 +383,16 @@ def group_incoming(params: dict[str, Any], request: Request) -> dict[str, Any]:
                 _json(original_body),
                 _json(receipt),
                 body["accepted_at"],
+                meta["profile"],
             ),
         )
         conn.execute(
             """
-            UPDATE group_views SET group_state_version = ?, group_event_seq = ?, updated_at = ?
+            UPDATE group_views SET updated_at = CASE WHEN group_event_seq <= ? THEN ? ELSE updated_at END,
+              group_state_version = MAX(group_state_version, ?), group_event_seq = MAX(group_event_seq, ?), wire_profile = ?
             WHERE owner_did = ? AND group_did = ?
             """,
-            (state_version, event_seq, body["accepted_at"], target_did, group_did),
+            (event_seq, body["accepted_at"], state_version, event_seq, meta["profile"], target_did, group_did),
         )
         sync_seq = runtime.add_sync_event(
             conn,

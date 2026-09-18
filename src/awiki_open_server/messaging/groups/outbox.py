@@ -10,7 +10,7 @@ from typing import Any
 from fastapi import FastAPI
 
 from awiki_open_server.shared import runtime
-from awiki_open_server.shared.errors import InvalidParams, Unauthorized
+from awiki_open_server.shared.errors import InvalidParams, NotSupported, Unauthorized
 from awiki_open_server.shared.ids import now_iso
 
 
@@ -101,12 +101,21 @@ def _deliver(app: FastAPI, row: Any) -> None:
             "outbox_target_service_did_changed",
             data={"expected": row["target_service_did"], "actual": discovered_service_did},
         )
+    # Notifications are consumed by Member Home, so its own public service
+    # declaration governs the wire version. The member document still binds
+    # the destination; it may predate Home's protocol upgrade.
+    home = runtime._discover_anp_service(str(discovered_service_did), settings)
+    if home.get("serviceDid") != discovered_service_did or home.get("serviceEndpoint") != service.get("serviceEndpoint"):
+        raise Unauthorized("outbox_target_home_endpoint_changed")
+    service = home
     endpoint = service.get("serviceEndpoint")
     if not isinstance(endpoint, str) or not endpoint:
         raise InvalidParams("anp_service_endpoint_required")
     envelope = json.loads(row["envelope_json"])
     if not isinstance(envelope, dict) or "id" in envelope:
         raise InvalidParams("group_notification_envelope_invalid")
+    if envelope.get("params", {}).get("meta", {}).get("profile") not in service.get("profiles", []):
+        raise NotSupported("peer_profile_not_supported")
     body_bytes = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
@@ -118,7 +127,7 @@ def _deliver(app: FastAPI, row: Any) -> None:
             raise Unauthorized("service_identity_not_configured")
     else:
         headers.update(identity.sign_headers(endpoint, "POST", headers, body_bytes))
-    response = runtime._http_post_json(endpoint, envelope, headers=headers, body_bytes=body_bytes)
+    response = runtime._http_post_json(endpoint, envelope, headers=headers, body_bytes=body_bytes, **runtime.outbound_options(service, settings))
     if isinstance(response, dict) and isinstance(response.get("error"), dict):
         raise InvalidParams(
             "remote_group_notification_rejected",
@@ -149,7 +158,7 @@ def _drain_group_outbox_locked(app: FastAPI, *, limit: int) -> dict[str, int]:
                 WHERE earlier.group_did = candidate.group_did
                   AND earlier.target_did = candidate.target_did
                   AND earlier.group_event_seq < candidate.group_event_seq
-                  AND earlier.status NOT IN ('delivered', 'dead')
+                  AND earlier.status != 'delivered'
               )
             ORDER BY candidate.next_attempt_at, candidate.created_at
             LIMIT ?
@@ -164,7 +173,7 @@ def _drain_group_outbox_locked(app: FastAPI, *, limit: int) -> dict[str, int]:
         try:
             _deliver(app, row)
         except Exception as exc:
-            status = "dead" if attempt_count >= MAX_DELIVERY_ATTEMPTS else "retry"
+            status = "dead" if attempt_count >= MAX_DELIVERY_ATTEMPTS or isinstance(exc, NotSupported) else "retry"
             next_attempt_at = now if status == "dead" else _next_attempt(attempt_count)
             with store.connect() as conn:
                 conn.execute(

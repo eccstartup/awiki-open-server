@@ -132,7 +132,13 @@ awiki-cli tenant setup local-community \
 awiki-cli init
 ```
 
-当前 Rust CLI 注册命令可能仍要求 `--phone` 或 `--email` 以保留命令形状；Open Server 默认不会发送真实 SMS/Email，也不会持久化生产联系验证状态。
+包含本轮兼容改动的候选 CLI 使用显式 Community 注册：
+
+```bash
+awiki-cli id register --handle alice --phone +15550000001 --otp <local-operator-code>
+```
+
+CLI 先验证所选 Home 的完整 Community 能力声明，再注册单设备身份；不需要占位手机号或 OTP。商业 Home 不接受该模式，仍使用原手机/邮箱验证。此入口随本轮 Core/CLI 交付，目前不能把已发布的旧 CLI 当作已支持该参数。Open Server 不发送真实 SMS/Email，也不增加联系验证产品。
 
 `localhost` 不是当前 CLI/WNS 接受的 DID host。本机验证应使用解析到 loopback 的
 `127.0.0.1.nip.io`；部署时替换为实际服务域名。
@@ -170,12 +176,12 @@ PYTHONPATH=../anp/anp:src uv run python scripts/awiki_open_cli.py \
 ```
 
 截至 2026-08-08，`awiki-cli` 1.0.43、提交 `bbeb8a5c` 已通过完整本地、Realtime/restart 与
-cross-domain Gate。`msg inbox/history` 使用受限的
-`anp.sync.local.v2`：一个 DID、恰好一个注册设备、一个 client instance，采用 tail-only
-bootstrap（从保留事件流起点拉取）、delta、batch hydration 和 thread catch-up。Open Server
-会拒绝第二个设备/client instance，不支持设备间共享、snapshot/compact recovery 或多设备游标
-收敛。standard-HTTPS 与 cross-domain 命令使用隔离的 Linux 网络命名空间，需要 `unshare`、
-`mount` 和 `ip`。验证记录必须包含 CLI commit、二进制摘要、Open Server commit 和实际执行的 Gate。
+cross-domain Gate。`msg inbox/history` 使用 `anp.sync.local.v2`：一个 DID、恰好一个注册设备、一个
+client instance。空账号可以 tail-only bootstrap；日志缺口和过期 cursor 走 Schema 3 分页
+Snapshot，再接普通 delta、batch hydration 和 thread catch-up。Open Server 会拒绝第二个设备/client
+instance，不支持设备间共享、多设备游标收敛或 E2EE。正式 CLI 1.0.52 仍请求 P5/P6，服务端返回
+`sync.lanes_not_supported`。standard-HTTPS 与 cross-domain 命令使用隔离的 Linux 网络命名空间，需要
+`unshare`、`mount` 和 `ip`。验证记录必须包含 CLI commit、二进制摘要、Open Server commit 和实际执行的 Gate。
 
 ## 9. 重要开发开关
 

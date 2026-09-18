@@ -54,6 +54,8 @@ async def test_direct_group_participant_and_public_surface(client):
 
     caps = await rpc(client, "/im/rpc", "anp.get_capabilities", token=alice_token)
     assert "anp.group.base.v1" in caps["result"]["supported_profiles"]
+    assert caps["result"]["proof_policies"]["direct_base_origin_proof"] == "required"
+    assert caps["result"]["limits"]["max_object_bytes"] == "10485760"
     assert caps["result"]["features"]["group_participant"]["management"] is True
     assert caps["result"]["features"]["group_participant"]["join_modes"] == ["open-join", "admin-add"]
     assert caps["result"]["features"]["group_participant"]["max_members"] == "100"
@@ -61,6 +63,9 @@ async def test_direct_group_participant_and_public_surface(client):
         "enabled": True,
         "mode": "did_discovery_direct_call",
     }
+    listed = await rpc(client, "/im/rpc", "group.list", {"limit": 20}, token=alice_token)
+    assert listed["result"]["has_more"] is False
+    assert "next_cursor" not in listed["result"]
 
     sent = await rpc(client, "/im/rpc", "direct.send", {"recipient_did": bob_did, "text": "hi"}, token=alice_token)
     assert sent["result"]["recipient_did"] == bob_did

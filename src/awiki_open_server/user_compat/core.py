@@ -4,12 +4,27 @@ from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
 import json
+import os
 import re
+import secrets
 from typing import Any
+from urllib.parse import unquote
 
 from fastapi import Request
+import jcs
 
 from awiki_open_server.app.settings import Settings
+from awiki_open_server.protocol.anp_adapter import (
+    AnpProtocolError,
+    SingleDeviceManifest,
+    require_did_document_binding,
+    signature_keyid,
+    validate_single_device_document,
+    verify_service_http_signature,
+    web_handle_hint,
+    web_handle_resolution_url,
+    verify_web_handle_documents,
+)
 from awiki_open_server.protocol.registry import STANDARD_PROFILES
 from awiki_open_server.service_identity import verify_did_document_data_integrity_proof
 from awiki_open_server.shared.errors import (
@@ -23,6 +38,9 @@ from awiki_open_server.shared.errors import (
 from awiki_open_server.shared.ids import new_id, now_iso
 from awiki_open_server.shared import runtime
 from awiki_open_server.storage.db import Store
+from awiki_open_server.user_compat.device_auth import (
+    bind_device_account, consume_auth_nonce, device_account, issue_device_token, validate_device_token,
+)
 
 
 def _json(data: Any) -> str:
@@ -57,52 +75,15 @@ def _future_iso(seconds: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
 
 
-def _b64u_json(value: dict[str, Any]) -> str:
-    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-
-
-def _device_access_token(did: str, user_id: str, document: dict[str, Any]) -> str | None:
-    manifest = document.get("deviceManifest")
-    devices = manifest.get("devices") if isinstance(manifest, dict) else None
-    device = devices[0] if isinstance(devices, list) and devices and isinstance(devices[0], dict) else None
-    if device is None:
-        return None
-    device_id = device.get("device_id")
-    key_id = device.get("signing_key_id")
-    if not isinstance(device_id, str) or not device_id or not isinstance(key_id, str) or not key_id:
-        return None
-    now = int(datetime.now(timezone.utc).timestamp())
-    claims = {
-        "iss": "user-service",
-        "aud": ["awiki-user-service", "awiki-message-service"],
-        "sub": did,
-        "type": "access",
-        "purpose": "awiki.device.access.v1",
-        "did": did,
-        "user_id": user_id,
-        "device_id": device_id,
-        "key_id": key_id,
-        "auth_generation": 1,
-        "scopes": ["device:manage", "device:read", "message:connect"],
-        "iat": now,
-        "nbf": now,
-        "exp": now + ACCESS_TOKEN_TTL_SECONDS,
-        "jti": new_id("jti"),
-    }
-    return f"{_b64u_json({'alg': 'none', 'typ': 'JWT'})}.{_b64u_json(claims)}.open-server"
-
-
-def _validate_single_device_manifest(document: dict[str, Any]) -> None:
-    manifest = document.get("deviceManifest")
-    if manifest is None:
-        return
-    devices = manifest.get("devices") if isinstance(manifest, dict) else None
-    if not isinstance(devices, list) or len(devices) != 1 or not isinstance(devices[0], dict):
-        raise NotSupported(
-            "multiple_devices_not_supported",
-            data={"max_devices_per_did": 1, "sync_mode": "single_device_pull_only"},
-        )
+def _validate_single_device_manifest(document: dict[str, Any]) -> SingleDeviceManifest | None:
+    try:
+        return validate_single_device_document(document)
+    except AnpProtocolError as exc:
+        if exc.code == "multiple_devices_not_supported":
+            raise NotSupported(
+                exc.code, data={"max_devices_per_did": 1, "sync_mode": "single_device_pull_only"},
+            ) from exc
+        raise InvalidParams("device_manifest_invalid") from exc
 
 
 def _is_past(value: Any) -> bool:
@@ -110,7 +91,7 @@ def _is_past(value: Any) -> bool:
         return False
     try:
         return _parse_time(value) <= datetime.now(timezone.utc)
-    except ValueError:
+    except (ValueError, TypeError):
         return True
 
 
@@ -126,7 +107,7 @@ def _did_domain(did: str) -> str | None:
 
 
 def _is_e1_did(did: str) -> bool:
-    return any(part.startswith("e1_") for part in _did_parts(did)[3:])
+    return len(_did_parts(did)) > 3 and _did_parts(did)[-1].startswith("e1_")
 
 
 def _default_user_did(settings: Settings, local_handle: str) -> str:
@@ -142,6 +123,8 @@ def _validate_local_user_did(did: str, settings: Settings) -> str:
         raise InvalidParams("did_domain_mismatch", data={"expected": settings.did_domain, "actual": domain})
     if not _is_e1_did(value):
         raise InvalidParams("did_e1_required")
+    if value == settings.service_did or unquote(_did_parts(value)[3]).lower() in {"group", "groups", "service", "services"}:
+        raise InvalidParams("did_namespace_reserved")
     return value
 
 
@@ -154,9 +137,15 @@ def get_settings(request: Request) -> Settings:
 
 
 def bearer_token(request: Request) -> str | None:
-    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    values = request.headers.getlist("authorization")
+    if len(values) > 1:
+        raise Unauthorized("invalid_bearer_token")
+    auth = values[0] if values else None
     if auth and auth.lower().startswith("bearer "):
-        return auth.split(" ", 1)[1]
+        token = auth.split(" ", 1)[1].strip()
+        if not token:
+            raise Unauthorized("invalid_bearer_token")
+        return token
     return None
 
 
@@ -185,7 +174,7 @@ def did_for_token(request: Request, token: str) -> str | None:
     with get_store(request).connect() as conn:
         row = conn.execute(
             """
-            SELECT u.did, u.access_expires_at
+            SELECT u.did, u.access_expires_at, d.document_json
             FROM users u
             JOIN did_documents d ON d.did = u.did
             WHERE u.token = ?
@@ -195,26 +184,94 @@ def did_for_token(request: Request, token: str) -> str | None:
             """,
             (token,),
         ).fetchone()
-    if row:
-        if _is_past(row["access_expires_at"]):
-            return None
-        return str(row["did"])
-    if token.startswith("did:") and _is_active_did(request, token):
-        return token
+        if row:
+            if _is_past(row["access_expires_at"]):
+                return None
+            try:
+                manifest = _validate_single_device_manifest(_load(row["document_json"]))
+                if manifest is not None:
+                    account = bind_device_account(conn, device_account(str(row["did"]), manifest))
+                    validate_device_token(token, account, request.app.state.auth_token_signing_key)
+                    request.state.device_account = account
+                elif conn.execute("SELECT 1 FROM single_device_accounts WHERE owner_did = ?", (row["did"],)).fetchone():
+                    return None
+            except (InvalidParams, NotSupported, Unauthorized, ValueError):
+                return None
+            return str(row["did"])
+    if get_settings(request).allow_unsigned_peer_dev and token.startswith("did:"):
+        with get_store(request).connect() as conn:
+            legacy = conn.execute(
+                """SELECT d.document_json FROM users u JOIN did_documents d ON d.did = u.did
+                   WHERE u.did = ? AND u.revoked_at IS NULL AND d.status = 'active'
+                     AND d.revoked_at IS NULL
+                     AND NOT EXISTS (SELECT 1 FROM single_device_accounts a WHERE a.owner_did = u.did)""",
+                (token,),
+            ).fetchone()
+        if legacy is not None and "deviceManifest" not in _load(legacy["document_json"]):
+            return token
     return None
 
 
 def current_did(request: Request, *, required: bool = True) -> str | None:
     token = bearer_token(request)
-    if not token:
+    if token:
+        did = did_for_token(request, token)
+        if did:
+            return did
         if required:
-            raise Unauthorized("missing_bearer_token")
+            raise Unauthorized("invalid_bearer_token")
         return None
-    did = did_for_token(request, token)
-    if did:
-        return did
+    did_auth_signature_path = request.url.path in {
+        "/user-service/v1/did-auth/rpc",
+        "/user-service/did-auth/rpc",
+        "/did-auth/rpc",
+    }
+    if (
+        did_auth_signature_path
+        and request.headers.get("signature-input")
+        and request.headers.get("signature")
+    ):
+        try:
+            key_id = signature_keyid(dict(request.headers))
+            did = key_id.split("#", 1)[0]
+            with get_store(request).connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT d.document_json FROM did_documents d
+                    JOIN users u ON u.did = d.did
+                    WHERE d.did = ? AND d.status = 'active' AND d.revoked_at IS NULL
+                      AND u.revoked_at IS NULL
+                    """,
+                    (did,),
+                ).fetchone()
+            if row is None:
+                raise Unauthorized("invalid_http_signature")
+            document = _load(row["document_json"])
+            manifest = _validate_single_device_manifest(document)
+            if manifest is not None and key_id != manifest.signing_key_id:
+                raise Unauthorized("device_signature_required")
+            raw_body = getattr(request.state, "raw_body", getattr(request, "_body", b""))
+            public_url = f"{get_settings(request).public_base_url.rstrip('/')}{request.url.path}"
+            if request.url.query:
+                public_url = f"{public_url}?{request.url.query}"
+            verification = verify_service_http_signature(
+                did_document=document,
+                request_method=request.method,
+                request_url=public_url,
+                headers=dict(request.headers),
+                body=raw_body,
+            )
+            with get_store(request).connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                consume_auth_nonce(conn, key_id, verification.metadata)
+            if manifest is not None:
+                request.state.signed_device_account = device_account(did, manifest)
+                request.state.device_account = request.state.signed_device_account
+            return did
+        except (AnpProtocolError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise Unauthorized("invalid_http_signature") from exc
     if required:
-        raise Unauthorized("invalid_bearer_token")
+        raise Unauthorized("invalid_bearer_token" if token else "missing_authentication")
     return None
 
 
@@ -245,7 +302,12 @@ def _ensure_anp_message_service(document: dict[str, Any], settings: Settings, di
         verification_method = proof.get("verificationMethod")
         if not isinstance(verification_method, str) or not verification_method.startswith(f"{did}#"):
             raise InvalidParams("did_document_proof_verification_method_mismatch")
-        verify_did_document_data_integrity_proof(doc, expected_did=did)
+        try:
+            verify_did_document_data_integrity_proof(doc, expected_did=did)
+            if not settings.allow_unsigned_peer_dev:
+                require_did_document_binding(doc)
+        except AnpProtocolError as exc:
+            raise InvalidParams(exc.code) from exc
         services = _anp_message_services(doc)
         if not services:
             raise InvalidParams("signed_did_document_requires_anp_message_service")
@@ -349,6 +411,7 @@ def _token_payload(
     access_expires_at: str,
     refresh_expires_at: str,
     refreshed: bool = False,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     return {
         "access_token": access_token,
@@ -359,7 +422,7 @@ def _token_payload(
         "expires_at": access_expires_at,
         "refresh_expires_at": refresh_expires_at,
         "did": did,
-        "user_id": did,
+        "user_id": user_id or did,
         "refreshed": refreshed,
     }
 
@@ -369,10 +432,12 @@ def _rotate_tokens_for_did(request: Request, did: str) -> dict[str, Any]:
     refresh_token = new_id("rtok")
     access_expires_at = _future_iso(ACCESS_TOKEN_TTL_SECONDS)
     refresh_expires_at = _future_iso(REFRESH_TOKEN_TTL_SECONDS)
+    account = None
     with get_store(request).connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             """
-            SELECT u.did
+            SELECT u.did, d.document_json
             FROM users u
             JOIN did_documents d ON d.did = u.did
             WHERE u.did = ?
@@ -384,6 +449,14 @@ def _rotate_tokens_for_did(request: Request, did: str) -> dict[str, Any]:
         ).fetchone()
         if not row:
             raise Unauthorized("did_not_found")
+        manifest = _validate_single_device_manifest(_load(row["document_json"]))
+        if manifest is not None:
+            account = device_account(did, manifest)
+            signed_account = getattr(request.state, "signed_device_account", None)
+            if signed_account is not None and signed_account != account:
+                raise Unauthorized("device_authorization_invalid")
+            bind_device_account(conn, account, create=signed_account == account)
+            access_token = issue_device_token(account, request.app.state.auth_token_signing_key, ACCESS_TOKEN_TTL_SECONDS)
         conn.execute(
             """
             UPDATE users
@@ -392,6 +465,8 @@ def _rotate_tokens_for_did(request: Request, did: str) -> dict[str, Any]:
             """,
             (access_token, refresh_token, access_expires_at, refresh_expires_at, did),
         )
+    if account is not None:
+        request.state.response_access_token = access_token
     return _token_payload(
         did=did,
         access_token=access_token,
@@ -399,6 +474,7 @@ def _rotate_tokens_for_did(request: Request, did: str) -> dict[str, Any]:
         access_expires_at=access_expires_at,
         refresh_expires_at=refresh_expires_at,
         refreshed=True,
+        user_id=account.account_id if account is not None else None,
     )
 
 
@@ -424,6 +500,25 @@ def refresh_access_token(params: dict[str, Any], request: Request) -> dict[str, 
     return _rotate_tokens_for_did(request, str(row["did"]))
 
 
+def _otp_hash(otp: str) -> str:
+    return hashlib.sha256(otp.encode()).hexdigest()
+
+
+def _consume_registration_otp(conn, *, phone: str, otp: str, handle: str | None) -> None:
+    row = conn.execute(
+        "SELECT * FROM local_registration_otps WHERE phone=? AND purpose=?",
+        (phone, "awiki.identity.register.v1"),
+    ).fetchone()
+    if row is None or _is_past(row["expires_at"]) or row["otp_hash"] != _otp_hash(otp):
+        raise Unauthorized("invalid_otp")
+    if handle and row["handle"] and row["handle"] != handle:
+        raise Unauthorized("invalid_otp")
+    conn.execute(
+        "DELETE FROM local_registration_otps WHERE phone=? AND purpose=?",
+        (phone, "awiki.identity.register.v1"),
+    )
+
+
 def register(params: dict[str, Any], request: Request) -> dict[str, Any]:
     settings = get_settings(request)
     raw_handle = params.get("handle") or f"user-{new_id('h')[2:8]}"
@@ -444,10 +539,18 @@ def register(params: dict[str, Any], request: Request) -> dict[str, Any]:
     refresh_expires_at = _future_iso(REFRESH_TOKEN_TTL_SECONDS)
     doc = _ensure_anp_message_service(uploaded_doc or did_document(settings, did, stored_handle), settings, did)
     doc["id"] = did
-    _validate_single_device_manifest(doc)
+    manifest = _validate_single_device_manifest(doc)
     user_id = f"user-{hashlib.sha256(did.encode()).hexdigest()[:24]}"
-    token = _device_access_token(did, user_id, doc) or token
+    account = device_account(did, manifest) if manifest is not None else None
+    if account is not None:
+        token = issue_device_token(account, request.app.state.auth_token_signing_key, ACCESS_TOKEN_TTL_SECONDS)
+    phone = str(params.get("phone") or "").strip()
+    otp_code = str(params.get("otp_code") or params.get("otp") or "").strip()
     with get_store(request).connect() as conn:
+        if phone:
+            if not otp_code:
+                raise InvalidParams("otp_required")
+            _consume_registration_otp(conn, phone=phone, otp=otp_code, handle=local_handle)
         existing_handle = conn.execute("SELECT did FROM users WHERE handle = ?", (stored_handle,)).fetchone()
         if existing_handle:
             raise Conflict("handle_already_registered", data={"handle": stored_handle, "did": existing_handle["did"]})
@@ -461,6 +564,8 @@ def register(params: dict[str, Any], request: Request) -> dict[str, Any]:
             """,
             (did, stored_handle, token, refresh_token, access_expires_at, refresh_expires_at, now_iso()),
         )
+        if account is not None:
+            bind_device_account(conn, account, create=True)
         conn.execute(
             "INSERT INTO profiles(did, handle, display_name, avatar_uri, profile_uri, description, subject_type, profile_md) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (did, stored_handle, display_name, params.get("avatar_uri"), params.get("profile_uri"), params.get("description"), "human", params.get("profile_md")),
@@ -471,7 +576,7 @@ def register(params: dict[str, Any], request: Request) -> dict[str, Any]:
         )
     result = {
         "did": did,
-        "user_id": did,
+        "user_id": user_id if account is not None else did,
         "message": "Registration successful",
         "handle": local_handle,
         "domain": settings.did_domain,
@@ -485,7 +590,11 @@ def register(params: dict[str, Any], request: Request) -> dict[str, Any]:
         "refresh_expires_at": refresh_expires_at,
         "document": doc,
     }
-    if request.url.path == "/user-service/v1/did-auth/rpc" and uploaded_doc and uploaded_doc.get("deviceManifest"):
+    if account is not None:
+        request.state.response_access_token = token
+    if request.url.path == "/user-service/v1/did-auth/rpc" and account is not None:
+        # Official CLI 1.0.52 parse_register_outcome requires exactly these nine
+        # fields; extra members fail closed as permission_denied.
         return {
             "state": "registered",
             "did": did,
@@ -517,6 +626,8 @@ def update_document(params: dict[str, Any], request: Request) -> dict[str, Any]:
     document = params.get("document") if isinstance(params.get("document"), dict) else params.get("did_document")
     if not isinstance(document, dict):
         raise InvalidParams("did_document_required")
+    if not isinstance(document.get("proof"), dict) and not settings.allow_unsigned_peer_dev:
+        raise InvalidParams("unsigned_did_document_requires_dev_mode")
     if document.get("id") not in (None, did):
         raise InvalidParams("document_id_mismatch")
     if isinstance(document.get("proof"), dict) and document.get("id") != did:
@@ -524,16 +635,50 @@ def update_document(params: dict[str, Any], request: Request) -> dict[str, Any]:
     if document.get("id") is None:
         document["id"] = did
     document = _ensure_anp_message_service(document, settings, did)
-    _validate_single_device_manifest(document)
+    new_manifest = _validate_single_device_manifest(document)
+    expected_hash = params.get("expected_document_hash")
+    if "expected_document_hash" in params and (not isinstance(expected_hash, str) or re.fullmatch(r"sha256:[A-Za-z0-9_-]{43}", expected_hash) is None):
+        raise InvalidParams("expected_document_hash_invalid")
+    expected_version = params.get("expected_document_version")
+    if "expected_document_version" in params and (type(expected_version) is not int or not 1 <= expected_version < 9223372036854775807 or expected_hash is None):
+        raise InvalidParams("expected_document_version_invalid")
     with get_store(request).connect() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO did_documents(did, document_json, updated_at, status, revoked_at)
-            VALUES (?, ?, ?, 'active', NULL)
-            """,
-            (did, _json(document), now_iso()),
-        )
-    return {"did": did, "document": document, "did_document": document}
+        conn.execute("BEGIN IMMEDIATE")
+        old_row = conn.execute(
+            "SELECT document_json, document_version FROM did_documents WHERE did = ? AND status = 'active' AND revoked_at IS NULL",
+            (did,),
+        ).fetchone()
+        if old_row is None:
+            raise Unauthorized("did_not_found")
+        old_document = _load(old_row["document_json"])
+        version = int(old_row["document_version"])
+        current_hash = "sha256:" + base64.urlsafe_b64encode(hashlib.sha256(jcs.canonicalize(old_document)).digest()).decode().rstrip("=")
+        exact_cas = expected_hash == current_hash and expected_version == version
+        if expected_version is not None:
+            if not exact_cas and not (document == old_document and expected_version < version):
+                raise Conflict("did_document_changed")
+        elif expected_hash is not None and document != old_document and current_hash != expected_hash:
+            raise Conflict("did_document_changed")
+        old_manifest = _validate_single_device_manifest(old_document)
+        if (old_manifest is None) != (new_manifest is None):
+            raise NotSupported("device_enrollment_or_removal_not_supported")
+        if old_manifest is not None:
+            current = device_account(did, old_manifest)
+            if device_account(did, new_manifest) != current:
+                raise NotSupported("device_key_or_root_change_not_supported")
+            bind_device_account(conn, current)
+        elif isinstance(old_document.get("proof"), dict) and not settings.allow_unsigned_peer_dev:
+            root_id = old_document["proof"].get("verificationMethod")
+            old_root = next((item for item in old_document.get("verificationMethod", []) if item.get("id") == root_id), None)
+            new_root = next((item for item in document.get("verificationMethod", []) if item.get("id") == root_id), None)
+            if old_root is None or new_root != old_root or document.get("proof", {}).get("verificationMethod") != root_id:
+                raise NotSupported("root_change_not_supported")
+        if document != old_document or exact_cas:
+            if version >= 9223372036854775807:
+                raise Conflict("document_version_exhausted")
+            version += 1
+            conn.execute("UPDATE did_documents SET document_json=?, document_version=?, updated_at=? WHERE did=?", (_json(document), version, now_iso(), did))
+    return {"did": did, "document": document, "did_document": document, "document_version": version}
 
 
 def revoke(_: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -620,7 +765,20 @@ def did_verify_refresh(params: dict[str, Any], request: Request) -> dict[str, An
 
 def get_me(_: dict[str, Any], request: Request) -> dict[str, Any]:
     did = current_did(request)
-    return public_profile({"did": did}, request)
+    profile = public_profile({"did": did}, request)
+    with get_store(request).connect() as conn:
+        document_row = conn.execute("SELECT document_json,document_version FROM did_documents WHERE did=? AND status='active' AND revoked_at IS NULL", (did,)).fetchone()
+        if document_row is None:
+            raise Unauthorized("did_not_found")
+        profile["did_document"] = _load(document_row["document_json"])
+        profile["document_version"] = int(document_row["document_version"])
+        profile["service_endpoints"] = profile["did_document"].get("service", [])
+    account = getattr(request.state, "device_account", None)
+    if account is not None:
+        profile["user_id"] = account.account_id
+    if not bearer_token(request) and request.headers.get("signature-input"):
+        return {**profile, **_rotate_tokens_for_did(request, did)}
+    return profile
 
 
 def update_me(params: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -931,6 +1089,36 @@ def _split_handle(handle: str, default_domain: str) -> tuple[str, str, str, str]
     return local, domain, stored, full
 
 
+def _remote_web_handle_lookup(request: Request, *, did: str | None = None, handle: str | None = None) -> dict[str, Any]:
+    settings = get_settings(request)
+    document = runtime._fetch_did_document(did, settings) if did else None
+    if document is not None:
+        if document.get("id") != did:
+            raise InvalidParams("did_document_id_mismatch")
+        handle = web_handle_hint(document)
+    if not handle:
+        raise _user_service_not_found("handle")
+    # Keep Web compatibility requests on the same pinned, bounded, no-redirect
+    # HTTP path as DID discovery; do not use the SDK's separate network client.
+    binding = runtime._http_get_json(web_handle_resolution_url(handle))
+    resolved = binding.get("did")
+    if not isinstance(resolved, str) or not resolved.startswith("did:web:") or (did is not None and resolved != did):
+        raise InvalidParams("web_handle_binding_invalid")
+    document = document or runtime._fetch_did_document(resolved, settings)
+    try:
+        verified = verify_web_handle_documents(handle, binding, document)
+    except AnpProtocolError as exc:
+        raise InvalidParams(exc.code) from exc
+    local, domain = verified.handle.split(".", 1)
+    # Preserve the existing directory-subject namespace; this is not a foreign
+    # account claim and does not create a local Web user or device binding.
+    return {"did": resolved, "user_id": f"user-{hashlib.sha256(resolved.encode()).hexdigest()[:24]}",
+            "handle": local, "domain": domain, "full_handle": verified.handle,
+            "binding_generation": verified.binding_generation, "status": "active",
+            "profile": {"did": resolved, "handle": f"{local}@{domain}",
+                        "display_name": verified.profile.display_name if verified.profile else local}}
+
+
 def handle_lookup(params: dict[str, Any], request: Request) -> dict[str, Any]:
     settings = get_settings(request)
     did = params.get("did")
@@ -968,6 +1156,8 @@ def handle_lookup(params: dict[str, Any], request: Request) -> dict[str, Any]:
         else:
             raise InvalidParams("did_or_handle_required")
     if not row:
+        if isinstance(did, str) and did.startswith("did:web:"):
+            return _remote_web_handle_lookup(request, did=did)
         if not isinstance(did, str) or _did_domain(did) in {None, settings.did_domain.lower()}:
             value = str(handle) if handle else None
             error = _user_service_not_found("handle", value)
@@ -1197,13 +1387,16 @@ def exchange_agent_token(params: dict[str, Any], request: Request) -> dict[str, 
     if document:
         document["id"] = str(agent_did)
     with get_store(request).connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM did_documents WHERE did=?", (str(agent_did),)).fetchone() is not None:
+            raise Conflict("did_document_already_registered")
         conn.execute(
             "UPDATE agent_registration_tokens SET used_at = ?, agent_did = ? WHERE token_hash = ?",
             (now_iso(), str(agent_did), row["token_hash"]),
         )
         if document:
             conn.execute(
-                "INSERT OR REPLACE INTO did_documents(did, document_json, updated_at) VALUES (?, ?, ?)",
+                "INSERT INTO did_documents(did, document_json, updated_at) VALUES (?, ?, ?)",
                 (str(agent_did), _json(document), now_iso()),
             )
     owner_profile = _profile_from_did(request, str(row["owner_did"]))
@@ -1647,6 +1840,38 @@ def agent_inventory_unbind_agent(params: dict[str, Any], request: Request) -> di
 
 def send_otp(params: dict[str, Any], request: Request) -> dict[str, Any]:
     settings = get_settings(request)
+    phone = str(params.get("phone") or "").strip()
+    if not phone:
+        raise InvalidParams("phone_required")
+    purpose = str(params.get("purpose") or "").strip()
+    if purpose == "awiki.identity.register.v1":
+        handle = str(params.get("handle") or "").strip() or None
+        otp = f"{secrets.randbelow(1_000_000):06d}"
+        expires_at = _future_iso(600)
+        with get_store(request).connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO local_registration_otps(phone, purpose, handle, otp_hash, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(phone, purpose) DO UPDATE SET
+                  handle=excluded.handle, otp_hash=excluded.otp_hash,
+                  expires_at=excluded.expires_at, created_at=excluded.created_at
+                """,
+                (phone, purpose, handle, _otp_hash(otp), expires_at, now_iso()),
+            )
+        otp_dir = settings.data_dir / "local-registration-otp"
+        otp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = otp_dir / re.sub(r"[^0-9A-Za-z]+", "_", phone)
+        path.write_text(otp + "\n")
+        os.chmod(path, 0o600)
+        return {
+            "ok": True,
+            "sent": True,
+            "delivery": "local_operator",
+            "phone": phone,
+            "handle": handle,
+            "expires_in": 600,
+        }
     if not settings.enable_contact_verification_compat:
         raise NotSupported(
             "contact_verification_not_enabled",
@@ -1655,9 +1880,6 @@ def send_otp(params: dict[str, Any], request: Request) -> dict[str, Any]:
                 "reason": "email_or_phone_verification_is_not_part_of_open_server_mvp",
             },
         )
-    phone = params.get("phone")
-    if not phone:
-        raise InvalidParams("phone_required")
     return {
         "ok": True,
         "sent": True,

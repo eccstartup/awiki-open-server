@@ -108,7 +108,15 @@ awiki-cli tenant setup local-community \
 awiki-cli init
 ```
 
-The Rust CLI registration shape may still require `--phone` or `--email`; Open Server does not send real SMS/email or persist production contact-verification state by default. `localhost` is not a valid DID host for current CLI/WNS validation. Use `127.0.0.1.nip.io` only for loopback testing and replace it with the deployment's real domain.
+The candidate CLI containing this protocol upgrade supports explicit Community registration:
+
+```bash
+awiki-cli id register --handle alice --phone +15550000001 --otp <local-operator-code>
+```
+
+The CLI verifies the selected Home's complete Community declaration before registering a single-device identity. No placeholder phone or OTP is required. Commercial Homes retain their normal phone/email verification. This option is part of the pending Core/CLI delivery; older published clients do not gain it automatically. Open Server does not add SMS/email verification.
+
+`localhost` is not a valid DID host for current CLI/WNS validation. Use `127.0.0.1.nip.io` only for loopback testing and replace it with the deployment's real domain.
 
 First run the clean-workspace connection-and-write gate. It verifies tenant configuration, two registrations through canonical User Service v1, and a plaintext Direct write, while recording CLI build metadata and the artifact SHA-256:
 
@@ -137,7 +145,7 @@ PYTHONPATH=../anp/anp:src uv run python scripts/awiki_open_cli.py \
   smoke-rust-cli-cross-domain --awiki-cli-bin /path/to/awiki-cli --clean
 ```
 
-As verified on 2026-08-08, `awiki-cli` 1.0.43 commit `bbeb8a5c` passes these gates. Inbox/History uses `anp.sync.local.v2` in a deliberately limited mode: one DID, exactly one registered device, one client instance, tail-only bootstrap from the retained event stream, delta pull, batch hydration, and thread catch-up. Open Server rejects a second device/client instance and does not implement device sharing, snapshot/compact recovery, or multi-device cursor convergence. The standard-HTTPS and cross-domain commands use an isolated Linux network namespace and require `unshare`, `mount`, and `ip`. Record the CLI commit, binary digest, server commit, and exact gate used.
+As verified on 2026-08-08, `awiki-cli` 1.0.43 commit `bbeb8a5c` passes these gates. Inbox/History uses `anp.sync.local.v2` for one DID, exactly one registered device, and one client instance. Empty accounts may tail-only bootstrap from the retained event stream; log gaps and expired cursors use Schema 3 paged Snapshot, then ordinary delta, batch hydration, and thread catch-up. Open Server rejects a second device/client instance and does not implement device sharing, multi-device cursor convergence, or E2EE. Official CLI 1.0.52 requests P5/P6; the server returns `sync.lanes_not_supported`. The standard-HTTPS and cross-domain commands use an isolated Linux network namespace and require `unshare`, `mount`, and `ip`. Record the CLI commit, binary digest, server commit, and exact gate used.
 
 ## 9. Important development switches
 

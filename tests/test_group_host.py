@@ -4,6 +4,8 @@ from dataclasses import replace
 import json
 import os
 import copy
+import functools
+import sys
 
 import httpx
 import pytest
@@ -24,6 +26,8 @@ from awiki_open_server.service_identity import (
 from awiki_open_server.shared.errors import InvalidParams
 from tests.conftest import rpc
 from tests.helpers import (
+    bound_did_keypair_document,
+    single_device_document,
     did_keypair_document,
     origin_proof,
     register_with_key,
@@ -41,10 +45,11 @@ def _group_envelope(
     body: dict,
     private_key,
     target_kind: str = "group",
+    profile: str = "anp.group.base.v1",
 ) -> dict:
     meta = {
         "anp_version": "1.0",
-        "profile": "anp.group.base.v1",
+        "profile": profile,
         "security_profile": "transport-protected",
         "sender_did": sender_did,
         "target": {"kind": target_kind, "did": target_did},
@@ -770,29 +775,31 @@ async def test_public_group_send_requires_peer_service_bound_to_sender_did(tmp_p
         )
     )
     remote_user_did = "did:wba:remote.example:users:member:e1_remote"
-    remote_user_key, remote_user_document = did_keypair_document(remote_user_did)
-    remote_user_document["service"][0]["serviceEndpoint"] = "https://awiki.info/anp-im/rpc"
+    remote_user_key, remote_user_document = bound_did_keypair_document(remote_user_did)
+    remote_user_did = remote_user_document["id"]
+    remote_user_document["service"][0]["serviceEndpoint"] = "https://remote.example/anp-im/rpc"
     remote_user_document["service"][0]["serviceDid"] = "did:wba:remote.example"
+    remote_user_document = sign_did_document(remote_user_document, remote_user_key)
     remote_service_key = generate_ed25519_private_key_pem()
     remote_service_document = build_service_did_document(
         "did:wba:remote.example",
-        "https://awiki.info/anp-im/rpc",
+        "https://remote.example/anp-im/rpc",
         remote_service_key,
     )
     remote_identity = service_identity_from_settings(
         service_did="did:wba:remote.example",
-        endpoint="https://awiki.info/anp-im/rpc",
+        endpoint="https://remote.example/anp-im/rpc",
         private_key_pem=remote_service_key,
     )
     attacker_key = generate_ed25519_private_key_pem()
     attacker_document = build_service_did_document(
         "did:wba:attacker.example",
-        "https://awiki.info/anp-im/rpc",
+        "https://remote.example/anp-im/rpc",
         attacker_key,
     )
     attacker_identity = service_identity_from_settings(
         service_did="did:wba:attacker.example",
-        endpoint="https://awiki.info/anp-im/rpc",
+        endpoint="https://remote.example/anp-im/rpc",
         private_key_pem=attacker_key,
     )
     assert remote_identity is not None
@@ -800,7 +807,7 @@ async def test_public_group_send_requires_peer_service_bound_to_sender_did(tmp_p
 
     def fake_get_json(url: str):
         documents = {
-            "https://remote.example/users/member/e1_remote/did.json": remote_user_document,
+            f"https://remote.example/users/member/{remote_user_did.rsplit(':', 1)[-1]}/did.json": remote_user_document,
             "https://remote.example/.well-known/did.json": remote_service_document,
             "https://attacker.example/.well-known/did.json": attacker_document,
         }
@@ -950,7 +957,7 @@ async def test_public_group_send_requires_peer_service_bound_to_sender_did(tmp_p
 
         deliveries = []
 
-        def accept_delivery(url, payload, *, headers=None, body_bytes=None):
+        def accept_delivery(url, payload, *, headers=None, body_bytes=None, allow_private=False):
             if payload.get("method") == "anp.get_capabilities":
                 return runtime_capabilities("did:wba:remote.example")
             deliveries.append((url, payload, headers, body_bytes))
@@ -979,8 +986,10 @@ async def test_public_group_send_requires_peer_service_bound_to_sender_did(tmp_p
         }
 
 
+@pytest.mark.parametrize("wire_profile", ["anp.group.base.v1", "anp.group.base.v2"])
 @pytest.mark.asyncio
-async def test_two_server_notifications_build_remote_member_projection(tmp_path, monkeypatch):
+async def test_two_server_notifications_build_remote_member_projection(tmp_path, monkeypatch, wire_profile):
+    monkeypatch.setattr(sys.modules[__name__], "_group_envelope", functools.partial(_group_envelope, profile=wire_profile))
     host_key = generate_ed25519_private_key_pem()
     home_key = generate_ed25519_private_key_pem()
     host_app = create_app(
@@ -1006,13 +1015,18 @@ async def test_two_server_notifications_build_remote_member_projection(tmp_path,
         )
     )
     owner_did = "did:wba:host.test:users:owner:e1_owner"
-    owner_key, owner_document = did_keypair_document(owner_did)
+    owner_key, owner_document = bound_did_keypair_document(owner_did)
+    owner_did = owner_document["id"]
     owner_document["service"][0].update(
         {"serviceEndpoint": "http://127.0.0.1:18081/anp-im/rpc", "serviceDid": "did:wba:host.test"}
     )
     owner_document = sign_did_document(owner_document, owner_key)
     member_did = "did:wba:home.test:users:member:e1_member"
-    member_key, member_document = did_keypair_document(member_did)
+    if wire_profile.endswith("v2"):
+        member_key, _, member_document = single_device_document(member_did)
+    else:
+        member_key, member_document = bound_did_keypair_document(member_did)
+    member_did = member_document["id"]
     member_document["service"][0].update(
         {"serviceEndpoint": "http://127.0.0.1:18082/anp-im/rpc", "serviceDid": "did:wba:home.test"}
     )
@@ -1020,9 +1034,9 @@ async def test_two_server_notifications_build_remote_member_projection(tmp_path,
     host_service_document = host_app.state.service_identity.did_document
     home_service_document = home_app.state.service_identity.did_document
     documents = {
-        "http://127.0.0.1:18081/users/owner/e1_owner/did.json": owner_document,
+        f"http://127.0.0.1:18081/users/owner/{owner_did.rsplit(':', 1)[-1]}/did.json": owner_document,
         "http://127.0.0.1:18081/.well-known/did.json": host_service_document,
-        "http://127.0.0.1:18082/users/member/e1_member/did.json": member_document,
+        f"http://127.0.0.1:18082/users/member/{member_did.rsplit(':', 1)[-1]}/did.json": member_document,
         "http://127.0.0.1:18082/.well-known/did.json": home_service_document,
     }
 
@@ -1147,7 +1161,8 @@ async def test_two_server_notifications_build_remote_member_projection(tmp_path,
                 content=tampered_raw,
                 headers=tampered_headers,
             )
-            assert tampered_response.status_code == 204
+            expected_status = 204 if wire_profile.endswith("v1") else (400 if envelope["method"] == "group.state_changed" else 401)
+            assert tampered_response.status_code == expected_status
             assert tampered_response.content == b""
 
             raw_body = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode()
@@ -1200,6 +1215,33 @@ async def test_two_server_notifications_build_remote_member_projection(tmp_path,
         assert projected_messages["result"]["messages"][0]["message_id"] == sent["result"]["message_id"]
         assert projected_messages["result"]["messages"][0]["content"] == "cross-domain projection"
 
+        if wire_profile.endswith("v2"):
+            from tests.test_sync_v2_single_device import _v2_params
+            boot = await rpc(home_client, "/im/rpc", "sync.bootstrap", _v2_params(member_did, "remote-boot", {
+                "client_instance_id": "remote-member-installation", "capabilities": {"sync_profile": "anp.sync.local.v2", "event_schema_max": 1},
+            }), token=member_token)
+            assert boot["result"]["group_state_baseline"][0]["group_did"] == group_did
+            delta = await rpc(home_client, "/im/rpc", "sync.delta", _v2_params(member_did, "remote-delta", {
+                "cursor": boot["result"]["cursor"], "limit": 100, "reason": "manual_refresh",
+            }), token=member_token)
+            message_events = [event for event in delta["result"]["events"] if event["event_type"] == "message.created"]
+            assert len(message_events) == 1
+            state_events = [event for event in delta["result"]["events"] if event["event_type"] == "group.member_changed"]
+            assert state_events and all(not event["ignore_safe"] for event in state_events)
+            batch = await rpc(home_client, "/im/rpc", "message.get_batch", _v2_params(member_did, "remote-batch", {"event_ids": [message_events[0]["event_id"]]}), token=member_token)
+            assert batch["result"]["unavailable"] == []
+            message = batch["result"]["items"][0]["message"]
+            assert message["content"] == "cross-domain projection"
+            assert message["wire_profile"] == wire_profile
+            assert message["group_receipt"]["message_id"] == message["message_id"]
+            history = await rpc(home_client, "/im/rpc", "sync.thread_after", _v2_params(member_did, "remote-history", {"thread_key": group_did, "after_server_seq": "0", "limit": 100}), token=member_token)
+            assert history["result"]["messages"][0]["message_id"] == message["message_id"]
+            read = await rpc(home_client, "/im/rpc", "read_state.mark_read", {
+                "meta": {"profile": "anp.read_state.local.v1", "security_profile": "transport-protected", "sender_did": member_did},
+                "body": {"user_did": member_did, "thread": {"kind": "group", "thread_key": group_did}, "read_up_to_server_seq": message["server_seq"], "read_up_to_message_id": message["message_id"]},
+            }, token=member_token)
+            assert read["result"]["remote_acknowledged"] is True
+
         host_snapshot = await rpc(
             host_client,
             "/im/rpc",
@@ -1211,7 +1253,7 @@ async def test_two_server_notifications_build_remote_member_projection(tmp_path,
         host_snapshot["result"].pop("group_event_seq", None)
         refresh_requests = []
 
-        def refresh_from_host(url, payload, *, headers=None, body_bytes=None):
+        def refresh_from_host(url, payload, *, headers=None, body_bytes=None, allow_private=False):
             if payload.get("method") == "anp.get_capabilities":
                 service_did = "did:wba:host.test" if ":18081/" in url else "did:wba:home.test"
                 return runtime_capabilities(service_did)
@@ -1235,7 +1277,7 @@ async def test_two_server_notifications_build_remote_member_projection(tmp_path,
         refresh_url, refresh_payload, refresh_headers, refresh_body = refresh_requests[0]
         assert refresh_url == "http://127.0.0.1:18081/anp-im/rpc"
         assert refresh_payload["method"] == "group.get_info"
-        assert refresh_payload["params"]["meta"]["profile"] == "anp.group.base.v1"
+        assert refresh_payload["params"]["meta"]["profile"] == wire_profile
         assert refresh_payload["params"]["meta"]["sender_did"] == member_did
         assert refresh_payload["params"]["meta"]["target"] == {"kind": "group", "did": group_did}
         assert refresh_payload["params"]["body"] == {
@@ -1283,7 +1325,7 @@ async def test_two_server_notifications_build_remote_member_projection(tmp_path,
 
         forwarded_payloads = []
 
-        def forward_to_host(url, payload, *, headers=None, body_bytes=None):
+        def forward_to_host(url, payload, *, headers=None, body_bytes=None, allow_private=False):
             if payload.get("method") == "anp.get_capabilities":
                 return runtime_capabilities("did:wba:host.test")
             forwarded_payloads.append((url, payload, headers, body_bytes))
@@ -1345,11 +1387,40 @@ async def test_two_server_notifications_build_remote_member_projection(tmp_path,
             token=member_token,
         )
         assert rejected["error"]["message"] == "group.not_member"
-        assert rejected["error"]["data"] == {"remote_code": 3000, "anp_code": "group.not_member"}
+        error_data = rejected["error"]["data"]
+        if wire_profile.endswith("v2"):
+            assert rejected["error"]["code"] == 3000
+            assert error_data["anp_code"] == "group.not_member"
+            error_data = error_data["details"]
+        assert error_data == {"remote_code": 3000, "anp_code": "group.not_member"}
+        if wire_profile.endswith("v2"):
+            removed = await _group_rpc(
+                host_client, method="group.remove", sender_did=owner_did, token=owner_token,
+                private_key=owner_key, target_did=group_did, operation_id="v2-terminal-removal",
+                body={"member_did": member_did},
+            )
+            assert removed["result"]["membership_status"] == "removed"
+            with host_app.state.store.connect() as conn:
+                pending = conn.execute("SELECT envelope_json FROM group_delivery_outbox WHERE group_did=? AND target_did=? ORDER BY group_event_seq", (group_did, member_did)).fetchall()
+            assert json.loads(pending[-1]["envelope_json"])["params"]["body"]["event_type"] == "member-removed"
+            for delivery in pending:
+                raw = delivery["envelope_json"].encode()
+                headers = {"Content-Type": "application/json", "x-anp-source-service-did": "did:wba:host.test"}
+                headers.update(host_app.state.service_identity.sign_headers("http://127.0.0.1:18082/anp-im/rpc", "POST", headers, raw))
+                terminal = await home_client.post("/anp-im/rpc", content=raw, headers=headers)
+                assert terminal.status_code == 204
+            with home_app.state.store.connect() as conn:
+                view = conn.execute("SELECT membership_status, wire_profile FROM group_views WHERE owner_did=? AND group_did=?", (member_did, group_did)).fetchone()
+                assert view["membership_status"] == "removed"
+                assert view["wire_profile"] == "anp.group.base.v2"
+            after = await rpc(home_client, "/im/rpc", "group.list_messages", {"group_did": group_did}, token=member_token)
+            assert "error" in after
 
 
+@pytest.mark.parametrize("wire_profile", ["anp.group.base.v1", "anp.group.base.v2"])
 @pytest.mark.asyncio
-async def test_two_server_open_join_routes_original_request_and_bootstraps_projection(tmp_path, monkeypatch):
+async def test_two_server_open_join_routes_original_request_and_bootstraps_projection(tmp_path, monkeypatch, wire_profile):
+    monkeypatch.setattr(sys.modules[__name__], "_group_envelope", functools.partial(_group_envelope, profile=wire_profile))
     host_app = create_app(
         Settings(
             data_dir=tmp_path / "join-host",
@@ -1371,7 +1442,8 @@ async def test_two_server_open_join_routes_original_request_and_bootstraps_proje
         )
     )
     owner_did = "did:wba:join-host.test:users:owner:e1_owner"
-    owner_key, owner_document = did_keypair_document(owner_did)
+    owner_key, owner_document = bound_did_keypair_document(owner_did)
+    owner_did = owner_document["id"]
     owner_document["service"][0].update(
         {
             "serviceEndpoint": "http://127.0.0.1:18181/anp-im/rpc",
@@ -1380,7 +1452,8 @@ async def test_two_server_open_join_routes_original_request_and_bootstraps_proje
     )
     owner_document = sign_did_document(owner_document, owner_key)
     joiner_did = "did:wba:join-home.test:users:joiner:e1_joiner"
-    joiner_key, joiner_document = did_keypair_document(joiner_did)
+    joiner_key, joiner_document = bound_did_keypair_document(joiner_did)
+    joiner_did = joiner_document["id"]
     joiner_document["service"][0].update(
         {
             "serviceEndpoint": "http://127.0.0.1:18182/anp-im/rpc",
@@ -1389,9 +1462,9 @@ async def test_two_server_open_join_routes_original_request_and_bootstraps_proje
     )
     joiner_document = sign_did_document(joiner_document, joiner_key)
     documents = {
-        "http://127.0.0.1:18181/users/owner/e1_owner/did.json": owner_document,
+        f"http://127.0.0.1:18181/users/owner/{owner_did.rsplit(':', 1)[-1]}/did.json": owner_document,
         "http://127.0.0.1:18181/.well-known/did.json": host_app.state.service_identity.did_document,
-        "http://127.0.0.1:18182/users/joiner/e1_joiner/did.json": joiner_document,
+        f"http://127.0.0.1:18182/users/joiner/{joiner_did.rsplit(':', 1)[-1]}/did.json": joiner_document,
         "http://127.0.0.1:18182/.well-known/did.json": home_app.state.service_identity.did_document,
     }
     monkeypatch.setattr(runtime, "_http_get_json", lambda url, **_kwargs: documents[url])
@@ -1492,7 +1565,7 @@ async def test_two_server_open_join_routes_original_request_and_bootstraps_proje
 
         forwarded = []
 
-        def route_to_host(url, payload, *, headers=None, body_bytes=None):
+        def route_to_host(url, payload, *, headers=None, body_bytes=None, allow_private=False):
             if payload.get("method") == "anp.get_capabilities":
                 return runtime_capabilities("did:wba:join-host.test")
             forwarded.append((url, payload, headers, body_bytes))

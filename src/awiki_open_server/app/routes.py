@@ -5,6 +5,8 @@ from pathlib import Path
 import asyncio
 from contextlib import suppress
 import secrets
+import urllib.parse
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
@@ -57,6 +59,15 @@ from awiki_open_server.user_compat import (
 from awiki_open_server.user_compat.groups import GROUP_COMPAT_HANDLERS
 
 
+def _unique_json_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate_json_member")
+        value[key] = item
+    return value
+
+
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, Unauthorized):
         return HTTPException(status_code=401, detail=exc.error_message)
@@ -93,8 +104,22 @@ def mount_routes(app: FastAPI) -> None:
     @app.post("/user-service/v1/did-auth/rpc")
     @app.post("/user-service/did-auth/rpc", include_in_schema=False)
     @app.post("/did-auth/rpc", include_in_schema=False)
-    async def did_auth_rpc(payload: dict, request: Request):
-        return await dispatch(payload, request, IDENTITY_HANDLERS)
+    async def did_auth_rpc(request: Request):
+        raw_body = await request.body()
+        request.state.raw_body = raw_body
+        try:
+            payload = json.loads(raw_body.decode(), object_pairs_hook=_unique_json_members)
+        except (UnicodeDecodeError, ValueError):
+            return JSONResponse(parse_error())
+        result = await dispatch(payload, request, IDENTITY_HANDLERS)
+        error = result.get("error", {})
+        if request.url.path == "/user-service/v1/did-auth/rpc" and error.get("code") == Unauthorized.code:
+            status = 403 if error.get("message") == "device_signature_required" else 401
+            return JSONResponse(result, status_code=status)
+        token = getattr(request.state, "response_access_token", None)
+        if token and "error" not in result:
+            return JSONResponse(result, headers={"Authorization": f"Bearer {token}", "Cache-Control": "no-store"})
+        return result
 
     @app.post("/user-service/v1/did-verify/rpc")
     @app.post("/user-service/did-verify/rpc", include_in_schema=False)
@@ -198,8 +223,29 @@ def mount_routes(app: FastAPI) -> None:
     async def personal_agent_rpc(payload: dict, request: Request):
         return await dispatch(payload, request, MESSAGE_AGENT_HANDLERS)
 
-    async def im_rpc(payload: dict, request: Request):
-        return await dispatch(payload, request, MESSAGE_HANDLERS)
+    async def im_rpc(request: Request):
+        raw_body = await request.body()
+        request.state.raw_body = raw_body
+        try:
+            payload = json.loads(raw_body.decode(), object_pairs_hook=_unique_json_members)
+        except (UnicodeDecodeError, ValueError):
+            return JSONResponse(parse_error())
+        params = payload.get("params") if isinstance(payload, dict) else None
+        meta = params.get("meta") if isinstance(params, dict) else None
+        # The existing local v1 facade keeps its response contract. Community
+        # sync v2 uses the explicit ANP envelope and error contract on /im/rpc.
+        canonical = isinstance(params, dict) and "meta" in params and (
+            not isinstance(meta, dict) or meta.get("profile") in {"anp.sync.local.v2", "anp.group.base.v2"}
+        )
+        result = await dispatch(payload, request, MESSAGE_HANDLERS, strict_anp=canonical, surface="local")
+        error = result.get("error", {}) if isinstance(result, dict) else {}
+        if canonical and error.get("code") == 1005 and error.get("message") in {
+            "invalid_bearer_token", "missing_authentication", "missing_bearer_token", "invalid_http_signature",
+            "device_authorization_invalid",
+        }:
+            error["message"] = "session_unauthorized"
+            return JSONResponse(result, status_code=401)
+        return result
     app.add_api_route(settings.im_rpc_path, im_rpc, methods=["POST"])
 
     @app.post("/user-service/v1/group/rpc")
@@ -229,6 +275,14 @@ def mount_routes(app: FastAPI) -> None:
         )
         method = payload.get("method") if isinstance(payload, dict) else None
         if method in PUBLIC_NOTIFICATION_METHODS and "id" not in payload:
+            params = payload.get("params")
+            meta = params.get("meta") if isinstance(params, dict) else None
+            if isinstance(meta, dict) and meta.get("profile") == "anp.group.base.v2":
+                status = getattr(request.state, "notification_error_status", None)
+                if status is not None:
+                    return Response(status_code=status)
+                if isinstance(result, dict) and "error" in result:
+                    return Response(status_code=400)
             return Response(status_code=204)
         if result is None:
             return Response(status_code=204)
@@ -308,22 +362,37 @@ def mount_routes(app: FastAPI) -> None:
         return await user_compat_ws_ticket_verify(request, ticket=ticket, token=token)
 
     async def im_ws(websocket: WebSocket):
-        token = websocket.query_params.get("token") or websocket.query_params.get("ticket")
-        if not token:
-            authorization = websocket.headers.get("authorization", "")
-            if authorization.lower().startswith("bearer "):
-                token = authorization[7:].strip()
+        offered_subprotocols = {value.strip() for value in websocket.headers.get("sec-websocket-protocol", "").split(",") if value.strip()}
+        v3 = "awiki.sync.event.v3" in offered_subprotocols
+        sync_changed_v2 = v3 or "awiki.sync.changed.v2" in offered_subprotocols
+        if offered_subprotocols and not sync_changed_v2:
+            await websocket.close(code=4406)
+            return
+        authorization = websocket.headers.get("authorization", "")
+        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else None
+        if not v3 and not token:
+            token = websocket.query_params.get("token") or websocket.query_params.get("ticket")
+        # Legacy query credentials remain readable by the route, but must not
+        # become part of the ASGI request target emitted by access logging.
+        websocket.scope["query_string"] = urllib.parse.urlencode([(key, value) for key, value in websocket.query_params.multi_items() if key not in {"token", "ticket"}]).encode()
         did = did_for_token(websocket, token) if token else None
         if not did:
             await websocket.close(code=4401)
             return
-        offered_subprotocols = {
-            value.strip()
-            for value in websocket.headers.get("sec-websocket-protocol", "").split(",")
-            if value.strip()
-        }
-        sync_changed_v2 = "awiki.sync.changed.v2" in offered_subprotocols
-        await websocket.accept(subprotocol="awiki.sync.changed.v2" if sync_changed_v2 else None)
+        def valid_binding():
+            if did_for_token(websocket, token) != did:
+                return False
+            if not v3:
+                return True
+            account = getattr(websocket.state, "device_account", None)
+            if account is None:
+                return False
+            with get_store(websocket).connect() as conn:
+                return conn.execute("SELECT 1 FROM sync_v2_bindings WHERE owner_did=? AND account_id=? AND device_id=?", (did, account.account_id, account.device_id)).fetchone() is not None
+        if not valid_binding():
+            await websocket.close(code=4401)
+            return
+        await websocket.accept(subprotocol="awiki.sync.event.v3" if v3 else "awiki.sync.changed.v2" if sync_changed_v2 else None)
         hub = websocket.app.state.realtime_hub
         queue = hub.subscribe(did)
         if sync_changed_v2:
@@ -367,12 +436,18 @@ def mount_routes(app: FastAPI) -> None:
                 done, pending = await asyncio.wait(
                     {notify_task, receive_task},
                     return_when=asyncio.FIRST_COMPLETED,
+                    timeout=30,
                 )
                 for task in pending:
                     task.cancel()
                 for task in pending:
                     with suppress(asyncio.CancelledError):
                         await task
+                if not valid_binding():
+                    await websocket.close(code=4401)
+                    break
+                if not done:
+                    continue
                 if notify_task in done:
                     notification = notify_task.result()
                     if sync_changed_v2:

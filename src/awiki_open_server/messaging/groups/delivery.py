@@ -92,7 +92,16 @@ def enqueue_state_changed(
     created_at: str,
 ) -> None:
     operation_id = str(event["group_receipt"]["operation_id"])
-    for member in _remote_members(conn, settings, group_did):
+    group = conn.execute("SELECT wire_profile FROM hosted_groups WHERE group_did = ?", (group_did,)).fetchone()
+    members = _remote_members(conn, settings, group_did)
+    if group["wire_profile"] == "anp.group.base.v2" and event.get("event_type") in {"member-removed", "member-left"}:
+        departed = conn.execute(
+            "SELECT * FROM hosted_group_members WHERE group_did = ? AND agent_did = ? AND home_service_did != ?",
+            (group_did, event.get("subject_did"), settings.service_did),
+        ).fetchone()
+        if departed is not None and all(row["agent_did"] != departed["agent_did"] for row in members):
+            members.append(departed)
+    for member in members:
         target_did = str(member["agent_did"])
         envelope = {
             "jsonrpc": "2.0",
@@ -100,7 +109,7 @@ def enqueue_state_changed(
             "params": {
                 "meta": {
                     "anp_version": "1.0",
-                    "profile": "anp.group.base.v1",
+                    "profile": group["wire_profile"],
                     "security_profile": "transport-protected",
                     "sender_did": group_did,
                     "target": {"kind": "agent", "did": target_did},

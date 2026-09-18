@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
 import json
 import socket
 from threading import Lock
@@ -8,12 +7,14 @@ import time
 import uuid
 from typing import Any
 import urllib.parse
-import urllib.request
 
 from fastapi import Request
 
 from awiki_open_server.app.settings import Settings
-from awiki_open_server.protocol.anp_adapter import AnpProtocolError, signature_keyid
+from awiki_open_server.protocol.anp_adapter import (
+    AnpProtocolError, did_resolution_authority, did_resolution_url, require_did_document_binding, signature_keyid,
+)
+from awiki_open_server.shared.outbound_http import request_bytes, resolve_target
 from awiki_open_server.service_identity import require_signed_peer_request, verify_peer_http_signature
 from awiki_open_server.shared.errors import InvalidParams, NotFound, Unauthorized
 from awiki_open_server.shared.ids import now_iso, new_id
@@ -29,109 +30,79 @@ def _load(raw: str) -> Any:
 
 
 def _did_domain(did: str) -> str:
-    parts = did.split(":")
-    if len(parts) < 3 or parts[0] != "did" or parts[1] != "wba" or not parts[2]:
-        raise InvalidParams("invalid_wba_did")
-    return parts[2].lower()
+    try:
+        return did_resolution_authority(did)
+    except AnpProtocolError as exc:
+        raise InvalidParams(exc.code) from exc
 
 
 def _did_belongs_to_domain(did: str, domain: str) -> bool:
+    # Resolution of remote Web DIDs does not grant local Web ownership.
     try:
-        return _did_domain(did) == domain.lower()
+        return did.startswith("did:wba:") and _did_domain(did) == domain.lower()
     except InvalidParams:
         return False
 
 
 def _did_document_url(did: str, resolver_base_urls: dict[str, str] | None = None) -> str:
-    parts = did.split(":")
-    domain = _did_domain(did)
-    base_url = (resolver_base_urls or {}).get(domain.lower())
-    if len(parts) == 3:
-        if base_url:
-            return f"{base_url.rstrip('/')}/.well-known/did.json"
-        return f"https://{domain}/.well-known/did.json"
-    path = "/".join(urllib.parse.quote(part, safe="") for part in parts[3:] if part)
-    if not path:
-        if base_url:
-            return f"{base_url.rstrip('/')}/.well-known/did.json"
-        return f"https://{domain}/.well-known/did.json"
-    if base_url:
-        return f"{base_url.rstrip('/')}/{path}/did.json"
-    return f"https://{domain}/{path}/did.json"
+    try:
+        authority = did_resolution_authority(did)
+        return did_resolution_url(did, base_url_override=(resolver_base_urls or {}).get(authority))
+    except AnpProtocolError as exc:
+        raise InvalidParams(exc.code) from exc
 
 
 _MAX_DISCOVERY_RESPONSE_BYTES = 1024 * 1024
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
-        return None
-
-
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 _DISCOVERY_CACHE_TTL_SECONDS = 60
 _DISCOVERY_CACHE_LOCK = Lock()
 _DISCOVERY_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
 
-def _read_bounded(response: Any, *, limit: int = _MAX_DISCOVERY_RESPONSE_BYTES) -> bytes:
-    raw = response.read(limit + 1)
-    if len(raw) > limit:
-        raise InvalidParams("remote_response_too_large", data={"max_bytes": limit})
-    return raw
-
-
 def _validate_outbound_url(url: str, *, allow_private: bool = False) -> None:
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.username or parsed.password:
-        raise InvalidParams("outbound_url_userinfo_not_allowed")
-    if parsed.scheme not in ({"http", "https"} if allow_private else {"https"}):
-        raise InvalidParams("outbound_url_scheme_not_allowed")
-    hostname = parsed.hostname
-    if not hostname:
-        raise InvalidParams("outbound_url_host_required")
+    resolve_target(url, allow_private=allow_private)
+
+
+def _unique_members(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate_json_member")
+        value[key] = item
+    return value
+
+
+def _decode_remote_object(raw: bytes) -> dict[str, Any]:
     try:
-        addresses = {
-            ipaddress.ip_address(item[4][0])
-            for item in socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
-        }
-    except (OSError, ValueError) as exc:
-        raise InvalidParams("outbound_url_host_unresolvable", data={"host": hostname}) from exc
-    if not allow_private:
-        for address in addresses:
-            if not address.is_global:
-                raise InvalidParams("outbound_url_private_address_not_allowed", data={"host": hostname})
+        value = json.loads(raw, object_pairs_hook=_unique_members)
+    except (ValueError, UnicodeError) as exc:
+        raise InvalidParams("remote_json_invalid") from exc
+    if not isinstance(value, dict):
+        raise InvalidParams("remote_response_must_be_object")
+    return value
 
 
 def _http_get_json(url: str, *, allow_private: bool = False) -> dict[str, Any]:
-    _validate_outbound_url(url, allow_private=allow_private)
-    with _NO_REDIRECT_OPENER.open(url, timeout=15) as response:
-        _validate_outbound_url(response.geturl(), allow_private=allow_private)
-        data = json.loads(_read_bounded(response).decode())
-    if not isinstance(data, dict):
-        raise InvalidParams("did_document_must_be_object")
-    return data
+    return _decode_remote_object(request_bytes(url, method="GET", allow_private=allow_private, limit=_MAX_DISCOVERY_RESPONSE_BYTES))
 
 
-def _http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None, body_bytes: bytes | None = None) -> dict[str, Any]:
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.username or parsed.password or parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise InvalidParams("outbound_url_invalid")
-    body = body_bytes or json.dumps(payload).encode()
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json", **(headers or {})},
-        method="POST",
-    )
-    with _NO_REDIRECT_OPENER.open(request, timeout=15) as response:
-        raw = _read_bounded(response)
-        if not raw:
-            return {}
-        data = json.loads(raw.decode())
-    if not isinstance(data, dict):
-        raise InvalidParams("remote_response_must_be_object")
-    return data
+def _http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None, body_bytes: bytes | None = None, *, allow_private: bool = False) -> dict[str, Any]:
+    body = body_bytes if body_bytes is not None else json.dumps(payload).encode()
+    raw = request_bytes(url, method="POST", body=body, headers={"Content-Type": "application/json", **(headers or {})}, allow_private=allow_private, limit=_MAX_DISCOVERY_RESPONSE_BYTES)
+    return _decode_remote_object(raw) if raw else {}
+
+
+def outbound_options(service: dict[str, Any], settings: Settings) -> dict[str, bool]:
+    authority = _did_domain(str(service.get("serviceDid", "")))
+    endpoint = urllib.parse.urlsplit(str(service.get("serviceEndpoint", "")))
+    origin = (endpoint.scheme, endpoint.netloc.lower())
+    override = (settings.did_resolver_base_urls or {}).get(authority)
+    if override is not None:
+        mapped = urllib.parse.urlsplit(override)
+        if origin == (mapped.scheme, mapped.netloc.lower()):
+            return {"allow_private": True}
+    if origin == ("https", authority):
+        return {}
+    raise InvalidParams("anp_service_endpoint_authority_mismatch")
 
 
 def _anp_message_service(document: dict[str, Any]) -> dict[str, Any]:
@@ -159,9 +130,15 @@ def _fetch_did_document(did: str, settings: Settings) -> dict[str, Any]:
     resolver_map = settings.did_resolver_base_urls or {}
     allow_private = domain in resolver_map
     url = _did_document_url(did, resolver_map)
-    if allow_private:
-        return _http_get_json(url, allow_private=True)
-    return _http_get_json(url)
+    document = _http_get_json(url, allow_private=True) if allow_private else _http_get_json(url)
+    if document.get("id") != did:
+        raise InvalidParams("did_document_id_mismatch")
+    if did.startswith("did:wba:"):
+        try:
+            require_did_document_binding(document)
+        except AnpProtocolError as exc:
+            raise InvalidParams(exc.code) from exc
+    return document
 
 
 def _discover_anp_service(did: str, settings: Settings) -> dict[str, Any]:
@@ -176,12 +153,12 @@ def _discover_anp_service(did: str, settings: Settings) -> dict[str, Any]:
         if isinstance(exc, (InvalidParams, NotFound)):
             raise
         raise NotFound("did_document_not_found", data={"did": did, "detail": str(exc)}) from exc
-    if document.get("id") not in (None, did):
+    if document.get("id") != did:
         raise InvalidParams("did_document_id_mismatch", data={"did": did, "document_id": document.get("id")})
     service = _anp_message_service(document)
     endpoint = str(service["serviceEndpoint"])
-    allow_private = _did_domain(did) in (settings.did_resolver_base_urls or {})
-    _validate_outbound_url(endpoint, allow_private=allow_private)
+    options = outbound_options(service, settings)
+    _validate_outbound_url(endpoint, **options)
     capabilities_request = {
         "jsonrpc": "2.0",
         "method": "anp.get_capabilities",
@@ -196,7 +173,7 @@ def _discover_anp_service(did: str, settings: Settings) -> dict[str, Any]:
         "id": f"discover-{uuid.uuid4().hex}",
     }
     try:
-        capabilities_response = _http_post_json(endpoint, capabilities_request)
+        capabilities_response = _http_post_json(endpoint, capabilities_request, **options)
     except Exception as exc:
         if isinstance(exc, (InvalidParams, NotFound)):
             raise
@@ -291,6 +268,9 @@ def _verify_peer_request_signature(
         service_did = signature_keyid(headers).split("#", 1)[0]
     except AnpProtocolError as exc:
         raise Unauthorized(exc.code, data={"detail": exc.detail}) from exc
+    declared_service = _source_service_did(headers)
+    if declared_service is not None and declared_service != service_did:
+        raise Unauthorized("signature_source_service_did_mismatch")
     if caller_anchor:
         caller_service = _discover_anp_service(caller_anchor, settings)
         expected_service_did = caller_service.get("serviceDid")
@@ -362,6 +342,11 @@ def _user_exists(conn, did: str) -> bool:
 def add_sync_event(conn, owner_did: str, event_type: str, payload: dict[str, Any]) -> int:
     row = conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS seq FROM sync_events WHERE owner_did = ?", (owner_did,)).fetchone()
     seq = int(row["seq"])
+    if event_type.startswith("group.") and not event_type.startswith("group.message.") and isinstance(payload.get("group_did"), str):
+        from awiki_open_server.messaging.sync_contract import group_snapshot
+        snapshot = group_snapshot(conn, owner_did, payload["group_did"])
+        if snapshot is not None:
+            payload = {**payload, "_sync_group": snapshot}
     conn.execute(
         "INSERT INTO sync_events(event_id, owner_did, event_seq, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         (new_id("sev"), owner_did, seq, event_type, _json(payload), now_iso()),

@@ -38,9 +38,26 @@ CREATE TABLE IF NOT EXISTS profiles (
   profile_md TEXT
 );
 
+CREATE TABLE IF NOT EXISTS single_device_accounts (
+  owner_did TEXT PRIMARY KEY REFERENCES users(did) ON DELETE CASCADE,
+  account_id TEXT UNIQUE NOT NULL,
+  device_id TEXT NOT NULL,
+  signing_key_id TEXT NOT NULL,
+  root_key_id TEXT NOT NULL,
+  key_fingerprint TEXT NOT NULL,
+  auth_generation INTEGER NOT NULL CHECK (auth_generation >= 1)
+);
+
+CREATE TABLE IF NOT EXISTS single_device_auth_nonces (
+  nonce_hash TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS single_device_auth_nonces_expiry ON single_device_auth_nonces(expires_at);
+
 CREATE TABLE IF NOT EXISTS did_documents (
   did TEXT PRIMARY KEY,
   document_json TEXT NOT NULL,
+  document_version INTEGER NOT NULL DEFAULT 1,
   updated_at TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active',
   revoked_at TEXT
@@ -105,6 +122,14 @@ CREATE TABLE IF NOT EXISTS sync_v2_bindings (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(account_id, device_id)
+);
+
+CREATE TABLE IF NOT EXISTS direct_conversation_refs (
+  owner_did TEXT NOT NULL,
+  peer_did TEXT NOT NULL,
+  conversation_ref TEXT NOT NULL,
+  PRIMARY KEY(owner_did, peer_did),
+  UNIQUE(owner_did, conversation_ref)
 );
 
 CREATE TABLE IF NOT EXISTS direct_message_views (
@@ -215,6 +240,18 @@ CREATE TABLE IF NOT EXISTS group_did_documents (
   key_reference TEXT NOT NULL,
   document_version INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS group_protocol_migrations (
+  group_did TEXT PRIMARY KEY REFERENCES hosted_groups(group_did) ON DELETE CASCADE,
+  plan_digest TEXT NOT NULL,
+  state TEXT NOT NULL,
+  preparation_id TEXT NOT NULL DEFAULT '',
+  document_before_json TEXT NOT NULL,
+  backup_path TEXT,
+  backup_digest TEXT,
+  prepared_at TEXT NOT NULL,
+  applied_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS group_views (
@@ -383,6 +420,51 @@ CREATE TABLE IF NOT EXISTS agent_inventory_statuses (
   archived_at TEXT,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS sync_capability_negotiations (
+  account_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  auth_generation INTEGER NOT NULL,
+  client_instance_id TEXT NOT NULL,
+  requested_json TEXT NOT NULL,
+  negotiated_json TEXT NOT NULL,
+  snapshot_schema INTEGER,
+  snapshot_delivery TEXT,
+  activation_state TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (account_id, device_id, auth_generation, client_instance_id)
+);
+
+CREATE TABLE IF NOT EXISTS sync_snapshot_sessions (
+  recovery_id TEXT PRIMARY KEY,
+  owner_did TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  auth_generation INTEGER NOT NULL,
+  client_instance_id TEXT NOT NULL,
+  stream_epoch TEXT NOT NULL,
+  snapshot_scan_seq TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  frozen_at TEXT NOT NULL,
+  message_cutoff TEXT NOT NULL,
+  status TEXT NOT NULL,
+  manifest_json TEXT NOT NULL,
+  package_json TEXT NOT NULL,
+  pages_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS local_registration_otps (
+  phone TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  handle TEXT,
+  otp_hash TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (phone, purpose)
+);
 """
 
 
@@ -422,7 +504,20 @@ class Store:
             self.ensure_column(conn, "users", "revoked_at", "TEXT")
             self.ensure_column(conn, "did_documents", "status", "TEXT NOT NULL DEFAULT 'active'")
             self.ensure_column(conn, "did_documents", "revoked_at", "TEXT")
+            self.ensure_column(conn, "did_documents", "document_version", "INTEGER NOT NULL DEFAULT 1")
             self.ensure_column(conn, "users", "handle_binding_generation", "TEXT NOT NULL DEFAULT '1'")
+            self.ensure_column(conn, "hosted_groups", "wire_profile", "TEXT NOT NULL DEFAULT 'anp.group.base.v1'")
+            self.ensure_column(conn, "hosted_groups", "protocol_state", "TEXT NOT NULL DEFAULT 'active'")
+            self.ensure_column(conn, "group_operations", "wire_profile", "TEXT NOT NULL DEFAULT 'anp.group.base.v1'")
+            self.ensure_column(conn, "hosted_group_messages", "wire_profile", "TEXT NOT NULL DEFAULT 'anp.group.base.v1'")
+            self.ensure_column(conn, "hosted_group_messages", "meta_json", "TEXT")
+            self.ensure_column(conn, "group_views", "wire_profile", "TEXT NOT NULL DEFAULT 'anp.group.base.v1'")
+            self.ensure_column(conn, "group_views", "observed_event_seq", "INTEGER NOT NULL DEFAULT 0")
+            self.ensure_column(conn, "group_views", "observed_state_version", "INTEGER NOT NULL DEFAULT 0")
+            self.ensure_column(conn, "group_message_views", "wire_profile", "TEXT NOT NULL DEFAULT 'anp.group.base.v1'")
+            self.ensure_column(conn, "group_protocol_migrations", "preparation_id", "TEXT NOT NULL DEFAULT ''")
+            self.ensure_column(conn, "thread_read_states", "state_version", "INTEGER NOT NULL DEFAULT 1")
+            self.ensure_column(conn, "thread_read_states", "read_message_id", "TEXT")
             legacy_group_columns = {row["name"] for row in conn.execute("PRAGMA table_info(groups)").fetchall()}
             if "invite_token" in legacy_group_columns:
                 conn.execute("UPDATE groups SET invite_token = NULL WHERE invite_token IS NOT NULL")
@@ -434,6 +529,12 @@ class Store:
                     (2, "direct-canonical-proof-and-idempotency"),
                     (3, "attachment-canonical-digest-contract"),
                     (4, "single-device-sync-v2-wire-compatibility"),
+                    (5, "single-device-authentication-binding"),
+                    (6, "group-base-v2-protocol-ownership"),
+                    (7, "community-sync-conversation-and-read-state"),
+                    (8, "identity-document-publication-revision"),
+                    (9, "remote-group-observation-boundaries"),
+                    (10, "standard-sync-negotiation-and-snapshot"),
                 ],
             )
             self.seed_groups(conn, did_domain)

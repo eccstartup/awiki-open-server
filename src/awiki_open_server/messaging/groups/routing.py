@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import Request
 
 from awiki_open_server.messaging.groups.projection import refresh_remote_member_projection
+from awiki_open_server.messaging.groups.protocol import discovered_group_profile
 from awiki_open_server.protocol.anp_adapter import verify_group_receipt
 from awiki_open_server.shared import runtime
 from awiki_open_server.shared.errors import Conflict, InvalidParams, NotFound, Unauthorized
@@ -62,6 +63,18 @@ def _validate_remote_receipt(
     receipt = result.get("group_receipt")
     if not isinstance(receipt, dict):
         reject("missing_receipt")
+    if params["_anp_meta"].get("profile") == "anp.group.base.v2":
+        if result.get("accepted") is not True or ("final_acceptance" in result and result["final_acceptance"] is not True):
+            reject("acceptance_required")
+        if result.get("group_did") != group_did or result.get("operation_id") != params["_anp_meta"].get("operation_id"):
+            reject("response_identity_mismatch")
+        if result.get("group_event_seq") != receipt.get("group_event_seq") or receipt.get("actor_did") != params["_anp_meta"].get("sender_did"):
+            reject("response_receipt_binding_mismatch")
+        expected_member = params["_anp_body"].get("member_did") if method in {"group.add", "group.remove"} else None
+        if expected_member is not None and result.get("member_did") != expected_member:
+            reject("response_member_mismatch")
+        if method == "group.leave" and result.get("leaver_did") != params["_anp_meta"].get("sender_did"):
+            reject("response_leaver_mismatch")
     if receipt.get("group_did") != group_did or receipt.get("subject_method") != method:
         reject("subject_mismatch")
     if receipt.get("operation_id") != params["_anp_meta"].get("operation_id"):
@@ -93,13 +106,29 @@ def _apply_terminal_projection(
     group_did = str(params["_anp_meta"]["target"]["did"])
     body = params["_anp_body"]
     with get_store(request).connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if params["_anp_meta"]["profile"] == "anp.group.base.v2" and method in {"group.leave", "group.remove"}:
+            receipt = result["group_receipt"]
+            key = (params["_anp_meta"]["sender_did"], group_did, method, params["_anp_meta"]["operation_id"])
+            prior = conn.execute(
+                "SELECT payload_digest, wire_profile, result_json FROM group_operations WHERE sender_did=? AND group_scope=? AND method=? AND operation_id=?", key,
+            ).fetchone()
+            if prior is not None:
+                if (prior["payload_digest"] != receipt["payload_digest"] or prior["wire_profile"] != "anp.group.base.v2"
+                        or json.loads(prior["result_json"]).get("group_receipt") != receipt):
+                    raise Conflict("group.remote_operation_receipt_conflict")
+            else:
+                conn.execute(
+                    "INSERT INTO group_operations(sender_did,group_scope,method,operation_id,payload_digest,result_json,created_at,wire_profile) VALUES (?,?,?,?,?,?,?,?)",
+                    (*key, receipt["payload_digest"], json.dumps(result, sort_keys=True, separators=(",", ":")), receipt["accepted_at"], "anp.group.base.v2"),
+                )
         if method == "group.leave":
             target_did = str(result.get("leaver_did") or params["_anp_meta"]["sender_did"])
             conn.execute(
                 """
                 UPDATE group_views SET membership_status = 'left',
                   group_state_version = ?, group_event_seq = ?, updated_at = ?
-                WHERE owner_did = ? AND group_did = ?
+                WHERE owner_did = ? AND group_did = ? AND group_event_seq <= ?
                 """,
                 (
                     int(result["group_state_version"]),
@@ -107,6 +136,7 @@ def _apply_terminal_projection(
                     result["group_receipt"]["accepted_at"],
                     target_did,
                     group_did,
+                    int(result.get("group_event_seq") or result["group_receipt"]["group_event_seq"]),
                 ),
             )
         elif method == "group.remove":
@@ -116,7 +146,7 @@ def _apply_terminal_projection(
                     """
                     UPDATE group_views SET membership_status = 'removed',
                       group_state_version = ?, group_event_seq = ?, updated_at = ?
-                    WHERE owner_did = ? AND group_did = ?
+                    WHERE owner_did = ? AND group_did = ? AND group_event_seq <= ?
                     """,
                     (
                         int(result["group_state_version"]),
@@ -124,6 +154,7 @@ def _apply_terminal_projection(
                         result["group_receipt"]["accepted_at"],
                         target_did,
                         group_did,
+                        int(result.get("group_event_seq") or result["group_receipt"]["group_event_seq"]),
                     ),
                 )
         else:
@@ -170,7 +201,9 @@ def _validated_member_snapshot(
     for item in members:
         if not isinstance(item, dict):
             raise InvalidParams("group.remote_snapshot_member_invalid")
-        member_did = item.get("agent_did")
+        member_did = item.get("member_did", item.get("agent_did"))
+        if item.get("member_did") is not None and item.get("agent_did") is not None and item["member_did"] != item["agent_did"]:
+            raise InvalidParams("group.remote_snapshot_member_invalid")
         role = item.get("role")
         status = item.get("status")
         if not isinstance(member_did, str) or not member_did or member_did in seen:
@@ -202,7 +235,7 @@ def refresh_remote_group_members(request: Request, group_did: str) -> bool:
     wire = {
         "meta": {
             "anp_version": "1.0",
-            "profile": "anp.group.base.v1",
+            "profile": discovered_group_profile(service),
             "security_profile": "transport-protected",
             "sender_did": owner_did,
             "target": {"kind": "group", "did": group_did},
@@ -221,7 +254,7 @@ def refresh_remote_group_members(request: Request, group_did: str) -> bool:
     else:
         headers.update(identity.sign_headers(endpoint, "POST", headers, body_bytes))
     try:
-        response = runtime._http_post_json(endpoint, payload, headers=headers, body_bytes=body_bytes)
+        response = runtime._http_post_json(endpoint, payload, headers=headers, body_bytes=body_bytes, **runtime.outbound_options(service, settings))
     except Exception as exc:
         raise InvalidParams("remote_group_snapshot_failed") from exc
     error = response.get("error") if isinstance(response, dict) else None
@@ -239,7 +272,9 @@ def refresh_remote_group_members(request: Request, group_did: str) -> bool:
         owner_did=owner_did,
         host_service_did=host_service_did,
     )
+    snapshot["wire_profile"] = discovered_group_profile(service)
     with get_store(request).connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         return refresh_remote_member_projection(
             conn,
             owner_did=owner_did,
@@ -271,6 +306,8 @@ def forward_group_command(
     if runtime._did_belongs_to_domain(group_did, settings.did_domain):
         raise NotFound("group.not_found")
     service = runtime._discover_anp_service(group_did, settings)
+    if meta.get("profile") != discovered_group_profile(service):
+        raise InvalidParams("group.discovery_profile_mismatch")
     endpoint = service.get("serviceEndpoint")
     if not isinstance(endpoint, str) or not endpoint:
         raise InvalidParams("anp_service_endpoint_required")
@@ -295,7 +332,7 @@ def forward_group_command(
     else:
         headers.update(identity.sign_headers(endpoint, "POST", headers, body_bytes))
     try:
-        response = runtime._http_post_json(endpoint, payload, headers=headers, body_bytes=body_bytes)
+        response = runtime._http_post_json(endpoint, payload, headers=headers, body_bytes=body_bytes, **runtime.outbound_options(service, settings))
     except Exception as exc:
         raise InvalidParams("remote_group_delivery_failed", data={"detail": str(exc)}) from exc
     error = response.get("error") if isinstance(response, dict) else None

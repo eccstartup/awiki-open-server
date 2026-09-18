@@ -12,6 +12,7 @@ STANDARD_PROFILES = (
     "anp.identity.discovery.v1",
     "anp.direct.base.v1",
     "anp.group.base.v1",
+    "anp.group.base.v2",
     "anp.attachment.v1",
     "anp.federation.relay.v1",
 )
@@ -22,6 +23,8 @@ LOCAL_PROFILES = (
     "anp.sync.local.v1",
     "anp.sync.local.v2",
     "anp.read_state.local.v1",
+    "awiki.message-sync.explicit-negotiation.v1",
+    "sync.snapshot_paging.v1",
 )
 
 
@@ -108,6 +111,7 @@ METHOD_CONTRACTS = {
                 principal="anonymous_or_peer" if method == "group.get_info" else "local_bearer_or_verified_peer",
                 origin_proof_required=method != "group.get_info",
                 wns_binding_required=method == "group.rebind_member",
+                alternate_profiles=() if method == "group.rebind_member" else ("anp.group.base.v2",),
             )
             for method, target in [
                 ("group.create", "service"),
@@ -124,6 +128,7 @@ METHOD_CONTRACTS = {
         _contract(
             "group.send",
             "anp.group.base.v1",
+            alternate_profiles=("anp.group.base.v2",),
             target_kind="group",
             message_required=True,
             content_type_required=True,
@@ -132,6 +137,7 @@ METHOD_CONTRACTS = {
         _contract(
             "group.incoming",
             "anp.group.base.v1",
+            alternate_profiles=("anp.group.base.v2",),
             rpc_kind="notification",
             target_kind="agent",
             message_required=True,
@@ -141,6 +147,7 @@ METHOD_CONTRACTS = {
         _contract(
             "group.state_changed",
             "anp.group.base.v1",
+            alternate_profiles=("anp.group.base.v2",),
             rpc_kind="notification",
             target_kind="agent",
             message_required=False,
@@ -215,7 +222,7 @@ METHOD_CONTRACTS = {
                 target_kind=None,
                 principal="local_bearer",
             )
-            for method in ["sync.bootstrap", "message.get_batch"]
+            for method in ["sync.bootstrap", "message.get_batch", "sync.snapshot"]
         ],
         _contract(
             "read_state.mark_read",

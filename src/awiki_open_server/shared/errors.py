@@ -51,3 +51,20 @@ class UserServiceNotFound(AwikiError):
 class Conflict(AwikiError):
     code = -32009
     message = "conflict"
+
+
+class SyncProtocolError(AwikiError):
+    """Ordinary-sync wire error with the frozen Message Service numeric codes."""
+
+    def __init__(
+        self,
+        anp_code: str,
+        *,
+        code: int = 4200,
+        retryable: bool = False,
+        details: dict | None = None,
+    ):
+        super().__init__(anp_code, data={"anp_code": anp_code, "retryable": retryable, "details": details or {}})
+        self.code = code
+        self.anp_code = anp_code
+        self.retryable = retryable

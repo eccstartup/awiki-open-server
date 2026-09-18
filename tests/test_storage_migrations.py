@@ -24,6 +24,12 @@ def test_protocol_alignment_migrations_are_additive_and_reentrant(tmp_path):
             (2, "direct-canonical-proof-and-idempotency"),
             (3, "attachment-canonical-digest-contract"),
             (4, "single-device-sync-v2-wire-compatibility"),
+            (5, "single-device-authentication-binding"),
+            (6, "group-base-v2-protocol-ownership"),
+            (7, "community-sync-conversation-and-read-state"),
+            (8, "identity-document-publication-revision"),
+            (9, "remote-group-observation-boundaries"),
+            (10, "standard-sync-negotiation-and-snapshot"),
         ]
         direct_columns = {row["name"] for row in conn.execute("PRAGMA table_info(direct_messages)")}
         assert {
@@ -40,3 +46,15 @@ def test_protocol_alignment_migrations_are_additive_and_reentrant(tmp_path):
         assert conn.execute(
             "SELECT COUNT(*) FROM schema_migrations WHERE version = 1"
         ).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM single_device_accounts").fetchone()[0] == 0
+        table_names = [
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('sync_capability_negotiations','sync_snapshot_sessions','local_registration_otps') ORDER BY name"
+            )
+        ]
+        assert table_names == [
+            "local_registration_otps",
+            "sync_capability_negotiations",
+            "sync_snapshot_sessions",
+        ]

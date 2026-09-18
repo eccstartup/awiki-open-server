@@ -60,6 +60,7 @@ def refresh_hosted_local_projections(
                 updated_at,
             ),
         )
+        conn.execute("UPDATE group_views SET wire_profile = ? WHERE owner_did = ? AND group_did = ?", (group["wire_profile"], owner_did, group_did))
         for member in members:
             conn.execute(
                 """
@@ -120,6 +121,7 @@ def refresh_remote_member_projection(
     event_seq = int(snapshot.get("group_event_seq", existing["group_event_seq"]))
     if state_version < int(existing["group_state_version"]) or event_seq < int(existing["group_event_seq"]):
         return False
+    new_observation = event_seq > int(existing["observed_event_seq"]) or state_version > int(existing["observed_state_version"])
 
     members = snapshot["member_list"]
     owner = next(member for member in members if member["member_did"] == owner_did)
@@ -130,7 +132,8 @@ def refresh_remote_member_projection(
         UPDATE group_views SET
           host_service_did = ?, profile_json = ?, policy_json = ?,
           group_state_version = ?, group_event_seq = ?, member_role = ?,
-          membership_status = 'active', updated_at = ?
+          membership_status = 'active', updated_at = ?, wire_profile = ?,
+          observed_event_seq = ?, observed_state_version = ?
         WHERE owner_did = ? AND group_did = ?
         """,
         (
@@ -141,6 +144,9 @@ def refresh_remote_member_projection(
             event_seq,
             owner["role"],
             updated_at,
+            snapshot.get("wire_profile", existing["wire_profile"]),
+            event_seq,
+            state_version,
             owner_did,
             group_did,
         ),
@@ -169,6 +175,11 @@ def refresh_remote_member_projection(
                 updated_at,
             ),
         )
+    if new_observation:
+        from awiki_open_server.shared.runtime import add_sync_event
+        # This is a local projection observation, not a fabricated Host business
+        # event or Receipt. Freeze the authenticated current view for sync.
+        add_sync_event(conn, owner_did, "group.projection_refreshed", {"group_did": group_did})
     return True
 
 
@@ -199,8 +210,8 @@ def project_hosted_message_for_local_members(
             """
             INSERT OR IGNORE INTO group_message_views(
               owner_did, group_did, message_id, group_event_seq, group_state_version,
-              sender_did, operation_id, content_type, body_json, receipt_json, accepted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              sender_did, operation_id, content_type, body_json, receipt_json, accepted_at, wire_profile
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT wire_profile FROM hosted_groups WHERE group_did = ?))
             """,
             (
                 owner["agent_did"],
@@ -214,5 +225,6 @@ def project_hosted_message_for_local_members(
                 _json(body),
                 _json(receipt),
                 accepted_at,
+                group_did,
             ),
         )

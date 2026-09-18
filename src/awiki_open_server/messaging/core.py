@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 from typing import Any
@@ -29,12 +29,14 @@ from awiki_open_server.messaging.groups import (
     projected_group_list_members,
     projected_group_list_messages,
 )
+from awiki_open_server.messaging import sync_contract
 from awiki_open_server.messaging.groups.inbound import INBOUND_GROUP_HANDLERS
 from awiki_open_server.messaging.groups.routing import forward_group_command, refresh_remote_group_members
 from awiki_open_server.protocol.registry import LOCAL_PROFILES, METHOD_CONTRACTS, STANDARD_PROFILES
 from awiki_open_server.service_identity import validate_origin_proof_structure
 from awiki_open_server.shared import runtime
-from awiki_open_server.shared.errors import AwikiError, Conflict, InvalidParams, NotFound, NotSupported, Unauthorized
+from awiki_open_server.messaging import standard_sync
+from awiki_open_server.shared.errors import AwikiError, Conflict, InvalidParams, NotFound, NotSupported, SyncProtocolError, Unauthorized
 from awiki_open_server.shared.ids import new_id, now_iso
 from awiki_open_server.user_compat.core import current_did, get_settings, get_store
 
@@ -97,8 +99,8 @@ def _group_sync_event_payload(
     }
 
 
-def _http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None, body_bytes: bytes | None = None) -> dict[str, Any]:
-    return runtime._http_post_json(url, payload, headers=headers, body_bytes=body_bytes)
+def _http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None, body_bytes: bytes | None = None, **options) -> dict[str, Any]:
+    return runtime._http_post_json(url, payload, headers=headers, body_bytes=body_bytes, **options)
 
 
 def capabilities(_: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -120,7 +122,7 @@ def capabilities(_: dict[str, Any], request: Request) -> dict[str, Any]:
         if contract.advertised
         and ((public_rpc and "public" in contract.surfaces) or (not public_rpc and "local" in contract.surfaces))
     }
-    return {
+    result = {
         "service_did": settings.service_did,
         "edition": "community",
         "profiles": profiles,
@@ -132,14 +134,15 @@ def capabilities(_: dict[str, Any], request: Request) -> dict[str, Any]:
             "application/json",
             "application/anp-attachment-manifest+json",
         ],
-        "transports": ["http", "ws"],
+        "transports": ["http", "wss" if settings.public_base_url.startswith("https://") else "ws"],
         "limits": {
-            "max_attachment_bytes": "10485760",
+            "max_object_bytes": str(settings.max_attachment_bytes),
+            "max_attachment_bytes": str(settings.max_attachment_bytes),
             "max_joined_groups_per_user": "20",
             "max_content_pages_per_handle": "5",
         },
         "proof_policies": {
-            "direct_base_origin_proof": "required_for_canonical_local_and_cross_domain",
+            "direct_base_origin_proof": "required",
             "group_base_origin_proof": "required_for_all_mutations_and_send",
             "direct_e2ee_origin_proof": "not_supported",
             "service_http_signature": "required_for_cross_domain",
@@ -187,12 +190,26 @@ def capabilities(_: dict[str, Any], request: Request) -> dict[str, Any]:
             "federation_relay": "commercial",
             "relay_mesh": "not_supported",
             "multi_device": "not_supported",
-            "sync_v2_mode": "single_device_pull_only",
+            "sync_v2_mode": "standard_explicit_negotiation",
             "encrypted_attachment": "not_supported",
             "managed_runtime_agents": "commercial",
             "tenant_site_hosting": "commercial",
         },
     }
+
+    if not public_rpc:
+        result["features"]["ordinary_sync"] = {
+            "profile": "anp.sync.local.v2",
+            "explicit_negotiation": standard_sync.EXPLICIT_NEGOTIATION_V1,
+            "snapshot": standard_sync.SNAPSHOT_PAGING_V1,
+            "snapshot_schema": 3,
+            "max_devices": 1,
+            "max_client_instances": 1,
+            "lanes": [],
+            "history": "retained_log",
+            "ws_subprotocol": "awiki.sync.event.v3",
+        }
+    return result
 
 
 def _store_direct_message(
@@ -545,7 +562,7 @@ def _send_remote_direct(
     else:
         headers.update(service_identity.sign_headers(str(service["serviceEndpoint"]), "POST", {"Content-Type": "application/json", **headers}, body_bytes))
     try:
-        response = _http_post_json(str(service["serviceEndpoint"]), payload, headers=headers, body_bytes=body_bytes)
+        response = _http_post_json(str(service["serviceEndpoint"]), payload, headers=headers, body_bytes=body_bytes, **runtime.outbound_options(service, settings))
     except Exception as exc:
         if isinstance(exc, (InvalidParams, NotFound)):
             raise
@@ -802,7 +819,7 @@ def _validate_send_envelope_meta(params: dict[str, Any], meta: dict[str, Any], *
         return
     expected_profile = "anp.group.base.v1" if target_kind == "group" else "anp.direct.base.v1"
     profile = _require_meta_string(meta, "profile", "anp_meta_profile_required")
-    if profile != expected_profile:
+    if profile != expected_profile and not (target_kind == "group" and profile == "anp.group.base.v2"):
         raise InvalidParams("anp_meta_profile_mismatch", data={"expected": expected_profile, "actual": profile})
     security_profile = _require_meta_string(meta, "security_profile", "anp_meta_security_profile_required")
     if security_profile != "transport-protected":
@@ -992,6 +1009,38 @@ def _message_ids_from_params(params: dict[str, Any]) -> list[str]:
     return message_ids
 
 
+def _advance_direct_read_prefix(conn: Any, owner: str, peer: str, read_at: str) -> None:
+    """Keep the thread watermark consistent with legacy per-message reads.
+
+    Reading a later message must not mark an earlier unread message as read.
+    Only the contiguous visible read prefix can advance the shared watermark.
+    """
+    thread_id = f"direct:{peer}"
+    previous = conn.execute(
+        "SELECT * FROM thread_read_states WHERE owner_did=? AND thread_id=?", (owner, thread_id)
+    ).fetchone()
+    previous_seq = int(previous["read_up_to_seq"]) if previous else 0
+    first_unread = conn.execute("""SELECT MIN(m.server_seq) FROM direct_messages m
+        JOIN direct_message_views v ON v.message_id=m.message_id
+        WHERE v.owner_did=? AND v.peer_did=? AND m.server_seq>? AND v.read_at IS NULL""",
+        (owner, peer, previous_seq)).fetchone()[0]
+    candidate = conn.execute("""SELECT m.message_id,m.server_seq FROM direct_messages m
+        JOIN direct_message_views v ON v.message_id=m.message_id
+        WHERE v.owner_did=? AND v.peer_did=? AND m.server_seq>? AND v.read_at IS NOT NULL
+          AND (? IS NULL OR m.server_seq<?) ORDER BY m.server_seq DESC LIMIT 1""",
+        (owner, peer, previous_seq, first_unread, first_unread)).fetchone()
+    if candidate is None:
+        return
+    version = int(previous["state_version"]) + 1 if previous else 1
+    conn.execute("""INSERT INTO thread_read_states(owner_did,thread_id,read_up_to_seq,updated_at,state_version,read_message_id)
+        VALUES (?,?,?,?,?,?) ON CONFLICT(owner_did,thread_id) DO UPDATE SET
+        read_up_to_seq=excluded.read_up_to_seq,updated_at=excluded.updated_at,
+        state_version=excluded.state_version,read_message_id=excluded.read_message_id""",
+        (owner, thread_id, candidate["server_seq"], read_at, version, candidate["message_id"]))
+    state = conn.execute("SELECT * FROM thread_read_states WHERE owner_did=? AND thread_id=?", (owner, thread_id)).fetchone()
+    add_sync_event(conn, owner, "message.read_state_updated", sync_contract.read_state_dto(conn, owner, state))
+
+
 def inbox_mark_read(params: dict[str, Any], request: Request) -> dict[str, Any]:
     owner = current_did(request)
     _validate_local_view_owner(params, owner, prefix="inbox")
@@ -999,9 +1048,10 @@ def inbox_mark_read(params: dict[str, Any], request: Request) -> dict[str, Any]:
     read_at = now_iso()
     placeholders = ",".join("?" for _ in message_ids)
     with get_store(request).connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         visible_rows = conn.execute(
             f"""
-            SELECT message_id
+            SELECT message_id,peer_did
             FROM direct_message_views
             WHERE owner_did = ? AND message_id IN ({placeholders})
             """,
@@ -1021,6 +1071,8 @@ def inbox_mark_read(params: dict[str, Any], request: Request) -> dict[str, Any]:
                 (read_at, owner, *visible_ids),
             )
             updated_count = int(conn.execute("SELECT changes() AS count").fetchone()["count"])
+            for peer in {str(row["peer_did"]) for row in visible_rows}:
+                _advance_direct_read_prefix(conn, owner, peer, read_at)
         else:
             updated_count = 0
     return {
@@ -1399,29 +1451,11 @@ def _thread_message_seq(conn: Any, *, owner: str, thread: dict[str, Any], messag
         group_did = thread.get("group_did")
         if not group_did:
             raise InvalidParams("thread_required")
-        hosted = conn.execute("SELECT 1 FROM hosted_groups WHERE group_did = ?", (group_did,)).fetchone()
-        if hosted:
-            member = conn.execute(
-                "SELECT 1 FROM hosted_group_members WHERE group_did = ? AND agent_did = ? AND status = 'active'",
-                (group_did, owner),
-            ).fetchone()
-        else:
-            member = conn.execute(
-                "SELECT 1 FROM group_members WHERE group_did = ? AND member_did = ?",
-                (group_did, owner),
-            ).fetchone()
-        if not member:
-            raise Unauthorized("read_state.group_membership_required")
-        if hosted:
-            row = conn.execute(
-                "SELECT group_event_seq AS server_seq FROM hosted_group_messages WHERE group_did = ? AND message_id = ?",
-                (group_did, message_id),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT server_seq FROM group_messages WHERE group_did = ? AND message_id = ?",
-                (group_did, message_id),
-            ).fetchone()
+        table, column = sync_contract.group_source(conn, owner, group_did)
+        owner_clause = " AND owner_did = ?" if table == "group_message_views" else ""
+        values = (group_did, message_id, owner) if owner_clause else (group_did, message_id)
+        row = conn.execute(f"SELECT {column} AS server_seq FROM {table} WHERE group_did = ? AND message_id = ?{owner_clause}", values).fetchone()
+
     else:
         raise InvalidParams("read_state.unsupported_thread_kind")
     if not row:
@@ -1484,38 +1518,27 @@ def _apply_read_watermark(
         group_did = thread.get("group_did")
         if not group_did:
             raise InvalidParams("thread_required")
-        hosted = conn.execute("SELECT 1 FROM hosted_groups WHERE group_did = ?", (group_did,)).fetchone()
-        if hosted:
-            member = conn.execute(
-                "SELECT 1 FROM hosted_group_members WHERE group_did = ? AND agent_did = ? AND status = 'active'",
-                (group_did, owner),
-            ).fetchone()
-            if not member:
-                raise Unauthorized("group.not_member")
-            table = "hosted_group_messages"
-            sequence_column = "group_event_seq"
-        else:
-            _require_group_member(conn, group_did, owner)
-            table = "group_messages"
-            sequence_column = "server_seq"
+        table, sequence_column = sync_contract.group_source(conn, owner, group_did)
+        owner_clause = " AND owner_did = ?" if table == "group_message_views" else ""
+        owner_args = (owner,) if owner_clause else ()
         updated = conn.execute(
             f"""
             SELECT COUNT(*) AS count
             FROM {table}
             WHERE group_did = ?
               AND {sequence_column} > ?
-              AND {sequence_column} <= ?
+              AND {sequence_column} <= ? {owner_clause}
             """,
-            (group_did, previous_seq, saved_seq),
+            (group_did, previous_seq, saved_seq, *owner_args),
         ).fetchone()
         unread = conn.execute(
             f"""
             SELECT COUNT(*) AS count
             FROM {table}
             WHERE group_did = ?
-              AND {sequence_column} > ?
+              AND {sequence_column} > ? {owner_clause}
             """,
-            (group_did, saved_seq),
+            (group_did, saved_seq, *owner_args),
         ).fetchone()
         return int(updated["count"]), int(unread["count"])
     raise InvalidParams("read_state.unsupported_thread_kind")
@@ -1525,13 +1548,27 @@ def mark_read(params: dict[str, Any], request: Request) -> dict[str, Any]:
     owner = current_did(request)
     if params.get("event_seq") or params.get("since_event_seq") or params.get("next_event_seq") or params.get("checkpoint") or params.get("read_up_to_group_event_seq"):
         raise InvalidParams("read_state.server_seq_invalid")
-    thread, thread_id = _thread_from_params(params)
+    _validate_local_view_owner(params, owner, prefix="read_state")
+    response_thread = params.get("thread")
+    mapped = params
+    if isinstance(response_thread, dict) and "thread_key" in response_thread:
+        key = response_thread["thread_key"]
+        with get_store(request).connect() as conn:
+            if response_thread.get("kind") == "direct":
+                internal_thread = {"kind": "direct", "peer_did": sync_contract.conversation_peer(conn, owner, key)}
+            elif response_thread.get("kind") == "group" and isinstance(key, str) and key.startswith("did:"):
+                internal_thread = {"kind": "group", "group_did": key}
+            else:
+                raise InvalidParams("thread_required")
+        mapped = {**params, "thread": internal_thread}
+    thread, thread_id = _thread_from_params(mapped)
     read_message_id = params.get("read_up_to_message_id")
     seq = _parse_read_watermark_seq(params.get("read_up_to_server_seq", params.get("read_up_to_seq")))
     if seq is None and not read_message_id:
         raise InvalidParams("read_state.watermark_required")
     read_at = now_iso()
     with get_store(request).connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         if read_message_id:
             message_seq = _thread_message_seq(conn, owner=owner, thread=thread, message_id=str(read_message_id))
             if seq is not None and seq != message_seq:
@@ -1539,15 +1576,29 @@ def mark_read(params: dict[str, Any], request: Request) -> dict[str, Any]:
             seq = message_seq
         assert seq is not None
         previous = conn.execute(
-            "SELECT read_up_to_seq FROM thread_read_states WHERE owner_did = ? AND thread_id = ?",
+            "SELECT * FROM thread_read_states WHERE owner_did = ? AND thread_id = ?",
             (owner, thread_id),
         ).fetchone()
         previous_seq = int(previous["read_up_to_seq"]) if previous else 0
         saved_seq = max(previous_seq, seq)
-        conn.execute(
-            "INSERT OR REPLACE INTO thread_read_states(owner_did, thread_id, read_up_to_seq, updated_at) VALUES (?, ?, ?, ?)",
-            (owner, thread_id, saved_seq, read_at),
-        )
+        if thread["kind"] == "direct":
+            highest = conn.execute("SELECT COALESCE(MAX(m.server_seq),0) FROM direct_messages m JOIN direct_message_views v ON v.message_id=m.message_id WHERE v.owner_did=? AND v.peer_did=?", (owner, thread["peer_did"])).fetchone()[0]
+        else:
+            table, column = sync_contract.group_source(conn, owner, thread["group_did"])
+            owner_clause = " AND owner_did=?" if table == "group_message_views" else ""
+            values = (thread["group_did"], owner) if owner_clause else (thread["group_did"],)
+            highest = conn.execute(f"SELECT COALESCE(MAX({column}),0) FROM {table} WHERE group_did=?{owner_clause}", values).fetchone()[0]
+        if seq > highest:
+            raise InvalidParams("read_state.watermark_mismatch")
+        advanced = saved_seq > previous_seq
+        state_version = int(previous["state_version"]) + int(advanced) if previous else 1
+        stored_message_id = read_message_id if seq == saved_seq and read_message_id else (previous["read_message_id"] if previous and saved_seq == previous_seq else None)
+        if previous and not advanced:
+            read_at = previous["updated_at"]
+        conn.execute("""INSERT INTO thread_read_states(owner_did,thread_id,read_up_to_seq,updated_at,state_version,read_message_id)
+            VALUES (?,?,?,?,?,?) ON CONFLICT(owner_did,thread_id) DO UPDATE SET read_up_to_seq=excluded.read_up_to_seq,
+            updated_at=excluded.updated_at,state_version=excluded.state_version,read_message_id=excluded.read_message_id""",
+            (owner, thread_id, saved_seq, read_at, state_version, stored_message_id))
         updated_count, unread_count = _apply_read_watermark(
             conn,
             owner=owner,
@@ -1556,12 +1607,15 @@ def mark_read(params: dict[str, Any], request: Request) -> dict[str, Any]:
             previous_seq=previous_seq,
             read_at=read_at,
         )
+        if advanced or previous is None:
+            state = conn.execute("SELECT * FROM thread_read_states WHERE owner_did=? AND thread_id=?", (owner, thread_id)).fetchone()
+            add_sync_event(conn, owner, "message.read_state_updated", sync_contract.read_state_dto(conn, owner, state))
     advanced = saved_seq > previous_seq
     warnings = [] if advanced or seq == previous_seq else ["read_state.watermark_not_advanced"]
-    return {
+    result = {
         "user_did": owner,
         "owner_did": owner,
-        "thread": thread,
+        "thread": response_thread if isinstance(response_thread, dict) else thread,
         "thread_id": thread_id,
         "updated_count": updated_count,
         "remote_acknowledged": True,
@@ -1570,37 +1624,28 @@ def mark_read(params: dict[str, Any], request: Request) -> dict[str, Any]:
         "pending_remote_ack": False,
         "read_watermark_server_seq": str(saved_seq),
         "previous_read_watermark_server_seq": str(previous_seq) if previous else None,
-        "read_watermark_message_id": read_message_id,
+        "read_watermark_message_id": stored_message_id,
         "advanced": advanced,
         "read_at": read_at,
         "unread_count": unread_count,
         "warnings": warnings,
         "read_up_to_seq": saved_seq,
     }
+    if isinstance(params.get("_anp_meta"), dict):
+        for field in ("owner_did", "thread_id", "read_up_to_seq"):
+            result.pop(field, None)
+    return result
 
-def _sync_v2_identity(request: Request) -> tuple[str, str, str]:
+
+def _sync_v2_identity(request: Request, params: dict[str, Any] | None = None) -> tuple[str, str, str]:
     owner = current_did(request)
-    with get_store(request).connect() as conn:
-        row = conn.execute(
-            """
-            SELECT d.document_json
-            FROM users u JOIN did_documents d ON d.did = u.did
-            WHERE u.did = ? AND u.revoked_at IS NULL AND d.status = 'active'
-            """,
-            (owner,),
-        ).fetchone()
-    if not row:
-        raise Unauthorized("sync.device_binding_missing")
-    document = _load(row["document_json"])
-    manifest = document.get("deviceManifest") if isinstance(document, dict) else None
-    devices = manifest.get("devices") if isinstance(manifest, dict) else None
-    if not isinstance(devices, list) or len(devices) != 1 or not isinstance(devices[0], dict):
-        raise NotSupported("sync.multiple_devices_not_supported")
-    device_id = devices[0].get("device_id")
-    if not isinstance(device_id, str) or not device_id.strip():
-        raise InvalidParams("sync.device_id_required")
-    account_id = f"user-{hashlib.sha256(owner.encode()).hexdigest()[:24]}"
-    return owner, account_id, device_id
+    account = getattr(request.state, "device_account", None)
+    if account is None or account.did != owner:
+        raise NotSupported("sync.single_device_authorization_required")
+    meta = (params or {}).get("_anp_meta", {})
+    if meta.get("sender_did") is not None and meta["sender_did"] != owner:
+        raise Unauthorized("sender_did_mismatch")
+    return owner, account.account_id, account.device_id
 
 
 def _sync_v2_profile(params: dict[str, Any]) -> bool:
@@ -1608,24 +1653,214 @@ def _sync_v2_profile(params: dict[str, Any]) -> bool:
     return meta.get("profile") == "anp.sync.local.v2"
 
 
-def sync_bootstrap_v2(params: dict[str, Any], request: Request) -> dict[str, Any]:
-    owner, account_id, device_id = _sync_v2_identity(request)
-    body = params.get("_anp_body") if isinstance(params.get("_anp_body"), dict) else params
-    if set(body) != {"client_instance_id", "capabilities"}:
-        raise InvalidParams("sync.bootstrap_body_invalid")
-    client_instance_id = body.get("client_instance_id")
-    capabilities_value = body.get("capabilities")
-    if not isinstance(client_instance_id, str) or not client_instance_id.strip() or len(client_instance_id) > 255:
-        raise InvalidParams("sync.client_instance_id_invalid")
-    if capabilities_value != {"sync_profile": "anp.sync.local.v2", "event_schema_max": 1}:
-        raise InvalidParams("sync.bootstrap_capabilities_invalid")
+def _auth_generation(request: Request) -> int:
+    account = getattr(request.state, "device_account", None)
+    return int(getattr(account, "auth_generation", 1) or 1)
+
+
+def _persist_negotiation(conn, *, account_id: str, device_id: str, auth_generation: int, client_instance_id: str, requested: tuple[str, ...], snapshot: bool) -> None:
     timestamp = now_iso()
+    conn.execute(
+        """
+        INSERT INTO sync_capability_negotiations(
+          account_id, device_id, auth_generation, client_instance_id, requested_json, negotiated_json,
+          snapshot_schema, snapshot_delivery, activation_state, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+        ON CONFLICT(account_id, device_id, auth_generation, client_instance_id) DO UPDATE SET
+          requested_json=excluded.requested_json,
+          negotiated_json=excluded.negotiated_json,
+          snapshot_schema=excluded.snapshot_schema,
+          snapshot_delivery=excluded.snapshot_delivery,
+          activation_state='active',
+          updated_at=excluded.updated_at
+        """,
+        (
+            account_id,
+            device_id,
+            auth_generation,
+            client_instance_id,
+            _json(list(requested)),
+            _json([]),
+            3 if snapshot else None,
+            "paged_v1" if snapshot else None,
+            timestamp,
+            timestamp,
+        ),
+    )
+
+
+def _negotiation_snapshot_enabled(conn, *, account_id: str, device_id: str, auth_generation: int, client_instance_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT snapshot_delivery, activation_state FROM sync_capability_negotiations
+        WHERE account_id=? AND device_id=? AND auth_generation=? AND client_instance_id=?
+        """,
+        (account_id, device_id, auth_generation, client_instance_id),
+    ).fetchone()
+    return bool(row and row["activation_state"] == "active" and row["snapshot_delivery"] == "paged_v1")
+
+
+def _log_gap(conn, owner: str) -> tuple[int, int, bool]:
+    count, highest = conn.execute(
+        "SELECT COUNT(*), COALESCE(MAX(event_seq),0) FROM sync_events WHERE owner_did=?",
+        (owner,),
+    ).fetchone()
+    return int(count), int(highest), int(count) != int(highest)
+
+
+def _recent_plain_message_items(conn, *, owner: str, account_id: str, epoch: str, highest: int, cutoff: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM sync_events WHERE owner_did=? AND event_seq<=? ORDER BY event_seq DESC",
+        (owner, highest),
+    ).fetchall()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        event = _sync_v2_event(row, owner=owner, account_id=account_id, conn=conn, epoch=epoch)
+        if event["event_type"] != "message.created":
+            continue
+        if str(event.get("occurred_at") or "") < cutoff:
+            continue
+        kind = "group" if event["payload"].get("message_kind") == "group_plain" else "direct"
+        message_id = event["payload"].get("client_message_id")
+        group_did = event["payload"].get("group_did")
+        message = _hydrated_sync_v2_message(conn, owner=owner, message_id=str(message_id), kind=kind, group_did=group_did) if message_id else None
+        if message is None:
+            continue
+        items.append({"event": event, "message": message})
+    return items
+
+
+def _issue_snapshot_recovery(
+    conn,
+    request: Request,
+    *,
+    owner: str,
+    account_id: str,
+    device_id: str,
+    auth_generation: int,
+    client_instance_id: str,
+    epoch: str,
+    highest: int,
+) -> dict[str, Any]:
+    frozen_at = now_iso()
+    cutoff = standard_sync.iso_hours_ago(standard_sync.MESSAGE_CUTOFF_HOURS, now=frozen_at)
+    read_states = [
+        sync_contract.read_state_dto(conn, owner, row)
+        for row in conn.execute(
+            "SELECT * FROM thread_read_states WHERE owner_did=? ORDER BY thread_id",
+            (owner,),
+        ).fetchall()
+    ]
+    groups = sync_contract.group_baseline(
+        conn, owner, host_service_did=request.app.state.settings.service_did
+    )
+    messages = _recent_plain_message_items(
+        conn, owner=owner, account_id=account_id, epoch=epoch, highest=highest, cutoff=cutoff
+    )
+    package, budget, history = standard_sync.select_snapshot_package(
+        read_states=read_states, groups=groups, notifications=[], messages=messages
+    )
+    pages = standard_sync.decorate_pages(standard_sync.paginate_sections(package))
+    cursor = {"stream_epoch": str(epoch), "scan_seq": str(highest)}
+    manifest = standard_sync.build_manifest(
+        frozen_at=frozen_at,
+        snapshot_cursor=cursor,
+        package=package,
+        pages=pages,
+        budget=budget,
+        history=history,
+        message_cutoff=cutoff,
+    )
+    recovery_id = standard_sync.new_recovery_id()
+    token = standard_sync.new_recovery_token()
+    expires_at = standard_sync.iso_later(standard_sync.RECOVERY_TTL_SECONDS, now=frozen_at)
+    key = request.app.state.snapshot_page_ref_key
+    stored_pages = []
+    for index, page in enumerate(pages):
+        claims = {
+            "version": 1,
+            "profile": standard_sync.SNAPSHOT_PAGING_V1,
+            "resource_hash": standard_sync.sha256_digest(recovery_id),
+            "query_hash": standard_sync.sha256_digest(
+                {"manifest": manifest["manifest_digest"], "account_id": account_id, "device_id": device_id, "position": index}
+            ),
+            "position": index,
+            "expires_at": expires_at,
+        }
+        stored_pages.append(
+            {
+                **page,
+                "has_more": index < len(pages) - 1,
+                "page_ref": standard_sync.sign_page_ref(key, claims),
+                "claims": claims,
+            }
+        )
+    for index, page in enumerate(stored_pages):
+        page["next_page_ref"] = stored_pages[index + 1]["page_ref"] if page["has_more"] else None
+    conn.execute(
+        """
+        INSERT INTO sync_snapshot_sessions(
+          recovery_id, owner_did, account_id, device_id, auth_generation, client_instance_id,
+          stream_epoch, snapshot_scan_seq, token_hash, expires_at, frozen_at, message_cutoff,
+          status, manifest_json, package_json, pages_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)
+        """,
+        (
+            recovery_id,
+            owner,
+            account_id,
+            device_id,
+            auth_generation,
+            client_instance_id,
+            str(epoch),
+            str(highest),
+            standard_sync.token_hash(token),
+            expires_at,
+            frozen_at,
+            cutoff,
+            _json(manifest),
+            _json(package),
+            _json(stored_pages),
+            frozen_at,
+        ),
+    )
+    return standard_sync.attach_standard_bootstrap_fields(
+        {
+            "mode": "compact_recovery_required",
+            "account_id": account_id,
+            "device_id": device_id,
+            "server_time": frozen_at,
+            "recovery": standard_sync.recovery_descriptor(
+                recovery_id=recovery_id,
+                token=token,
+                stream_epoch=str(epoch),
+                snapshot_scan_seq=str(highest),
+                message_cutoff=cutoff,
+                expires_at=expires_at,
+            ),
+        },
+        snapshot_paging=True,
+    )
+
+
+def sync_bootstrap_v2(params: dict[str, Any], request: Request) -> dict[str, Any]:
+    owner, account_id, device_id = _sync_v2_identity(request, params)
+    body = params.get("_anp_body") if isinstance(params.get("_anp_body"), dict) else params
+    caps = standard_sync.parse_bootstrap_capabilities(body)
+    timestamp = now_iso()
+    auth_generation = _auth_generation(request)
     with get_store(request).connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute("SELECT * FROM sync_v2_bindings WHERE owner_did = ?", (owner,)).fetchone()
-        if existing and (existing["device_id"] != device_id or existing["client_instance_id"] != client_instance_id):
+        if existing and existing["account_id"] != account_id:
+            raise Unauthorized("sync.account_binding_mismatch")
+        if existing and (existing["device_id"] != device_id or existing["client_instance_id"] != caps.client_instance_id):
             raise NotSupported(
                 "sync.multiple_devices_not_supported",
-                data={"mode": "single_device_pull_only"},
+                data={
+                    "mode": "single_device_pull_only",
+                    "reason": "second_device" if existing["device_id"] != device_id else "second_client_instance",
+                },
             )
         if not existing:
             conn.execute(
@@ -1634,24 +1869,58 @@ def sync_bootstrap_v2(params: dict[str, Any], request: Request) -> dict[str, Any
                   owner_did, account_id, device_id, client_instance_id, stream_epoch, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, 1, ?, ?)
                 """,
-                (owner, account_id, device_id, client_instance_id, timestamp, timestamp),
+                (owner, account_id, device_id, caps.client_instance_id, timestamp, timestamp),
             )
-    return {
+        epoch = str(existing["stream_epoch"]) if existing else "1"
+        if caps.extended:
+            _persist_negotiation(
+                conn,
+                account_id=account_id,
+                device_id=device_id,
+                auth_generation=auth_generation,
+                client_instance_id=caps.client_instance_id,
+                requested=caps.requested,
+                snapshot=caps.snapshot_paging,
+            )
+        count, highest, gap = _log_gap(conn, owner)
+        if gap and caps.snapshot_paging:
+            return _issue_snapshot_recovery(
+                conn,
+                request,
+                owner=owner,
+                account_id=account_id,
+                device_id=device_id,
+                auth_generation=auth_generation,
+                client_instance_id=caps.client_instance_id,
+                epoch=epoch,
+                highest=highest,
+            )
+        if gap:
+            raise InvalidParams("sync.retained_log_incomplete")
+        groups = sync_contract.group_baseline(
+            conn, owner, host_service_did=request.app.state.settings.service_did
+        )
+        read_states = [
+            sync_contract.read_state_dto(conn, owner, row)
+            for row in conn.execute(
+                "SELECT * FROM thread_read_states WHERE owner_did=? ORDER BY thread_id",
+                (owner,),
+            ).fetchall()
+        ]
+    result = {
         "mode": "tail_only",
         "account_id": account_id,
         "device_id": device_id,
         "server_time": timestamp,
-        # Open Server has one device and no replica handoff. A fresh binding
-        # starts at zero so that the one local device pulls its complete retained
-        # account stream instead of relying on cross-device snapshot transfer.
-        "cursor": {"stream_epoch": "1", "scan_seq": "0"},
-        "read_state_baseline": [],
-        "group_state_baseline": [],
-        "warnings": ["single_device_pull_only"],
+        "cursor": {"stream_epoch": epoch, "scan_seq": "0"},
+        "read_state_baseline": read_states,
+        "group_state_baseline": groups,
+        "warnings": [] if caps.extended else ["single_device_pull_only"],
     }
+    return standard_sync.attach_standard_bootstrap_fields(result, snapshot_paging=caps.snapshot_paging)
 
 
-def _sync_v2_event(row: Any, *, owner: str, account_id: str) -> dict[str, Any]:
+def _sync_v2_event(row: Any, *, owner: str, account_id: str, conn: Any, epoch: str) -> dict[str, Any]:
     original = _load(row["payload_json"])
     message = original.get("message") if isinstance(original.get("message"), dict) else {}
     thread = original.get("thread") if isinstance(original.get("thread"), dict) else {}
@@ -1662,9 +1931,10 @@ def _sync_v2_event(row: Any, *, owner: str, account_id: str) -> dict[str, Any]:
     group_did = message.get("group_did") or original.get("group_did") or thread.get("group_did")
     sender_did = message.get("sender_did") or original.get("sender_did")
     recipient_did = message.get("recipient_did") or message.get("receiver_did")
+    state_version = None
     if is_direct_message or is_group_message:
         peer_did = thread.get("peer_did")
-        thread_key = str(group_did) if is_group_message else f"direct:{peer_did}"
+        thread_key = str(group_did) if is_group_message else sync_contract.conversation_ref(conn, owner, str(peer_did))
         direction = "outgoing/self" if sender_did == owner else "incoming"
         event_type = "message.created"
         payload = {
@@ -1679,6 +1949,42 @@ def _sync_v2_event(row: Any, *, owner: str, account_id: str) -> dict[str, Any]:
         aggregate_kind = "group_message" if is_group_message else "direct_message"
         aggregate_id = str(message_id)
         ignore_safe = False
+    elif original_type in {"read_state.updated", "message.read_state_updated"}:
+        event_type = "message.read_state_updated"
+        payload = original
+        aggregate_kind = "read_state"
+        aggregate_id = thread_key = original["thread_key"]
+        state_version = original["state_version"]
+        ignore_safe = False
+    elif original_type.startswith("group.") and group_did:
+        snapshot = original.get("_sync_group")
+        if not isinstance(snapshot, dict):
+            # Older creation entries were sparse. Reconstruct only immutable
+            # acceptance facts, never the mutable current group state.
+            snapshot = dict(original)
+            if original_type == "group.created":
+                accepted = conn.execute("SELECT payload_json FROM hosted_group_events WHERE group_did=? AND group_event_seq=1", (group_did,)).fetchone()
+                if accepted:
+                    snapshot.update(_load(accepted["payload_json"]))
+        state_version = str(snapshot.get("group_state_version", "1"))
+        group = {"group_did": group_did, "group_state_version": state_version,
+                 "group_event_seq": str(snapshot.get("group_event_seq", original.get("group_event_seq", "1"))),
+                 "required_security_profile": "transport-protected"}
+        if isinstance(snapshot.get("group_profile"), dict):
+            group["profile"] = snapshot["group_profile"]
+        membership = {"subject_did": original.get("subject_did", owner),
+                      "actor_did": original.get("actor_did", owner)}
+        if original.get("subject_did"):
+            membership["status"] = original.get("membership_status", "active")
+            if original.get("role"):
+                membership["role"] = original["role"]
+        elif snapshot.get("membership_status"):
+            membership.update(status=snapshot["membership_status"], role=snapshot.get("member_role", "member"))
+        payload = {"thread_kind": "group", "thread": {"kind": "group", "group_did": group_did}, "group": group, "membership": membership}
+        event_type = "group.member_changed" if original.get("subject_did") else "group.profile_updated"
+        aggregate_kind = "group"
+        aggregate_id = thread_key = str(group_did)
+        ignore_safe = False
     else:
         event_type = f"awiki.open.{original_type}"
         payload = original
@@ -1688,7 +1994,7 @@ def _sync_v2_event(row: Any, *, owner: str, account_id: str) -> dict[str, Any]:
         ignore_safe = True
     return {
         "event_id": str(row["event_id"]),
-        "stream_epoch": "1",
+        "stream_epoch": epoch,
         "event_seq": str(row["event_seq"]),
         "event_type": event_type,
         "schema_version": 1,
@@ -1699,7 +2005,7 @@ def _sync_v2_event(row: Any, *, owner: str, account_id: str) -> dict[str, Any]:
         "origin_device_id": None,
         "aggregate_kind": aggregate_kind,
         "aggregate_id": aggregate_id,
-        "state_version": None,
+        "state_version": state_version,
         "thread_key": thread_key,
         "occurred_at": str(row["created_at"]),
         "payload": payload,
@@ -1708,40 +2014,103 @@ def _sync_v2_event(row: Any, *, owner: str, account_id: str) -> dict[str, Any]:
 
 
 def sync_delta_v2(params: dict[str, Any], request: Request) -> dict[str, Any]:
-    owner, account_id, device_id = _sync_v2_identity(request)
+    owner, account_id, device_id = _sync_v2_identity(request, params)
     body = params.get("_anp_body") if isinstance(params.get("_anp_body"), dict) else params
     if set(body) != {"cursor", "limit", "reason"}:
         raise InvalidParams("sync.delta_body_invalid")
     cursor = body.get("cursor")
     if not isinstance(cursor, dict) or set(cursor) != {"stream_epoch", "scan_seq"}:
         raise InvalidParams("sync.invalid_cursor")
-    if cursor.get("stream_epoch") != "1":
-        raise InvalidParams("sync.invalid_cursor")
-    after = _parse_non_negative_int(cursor.get("scan_seq"), field="sync.scan_seq", default=0)
-    limit = _parse_non_negative_int(body.get("limit"), field="limit", default=100)
-    if not 1 <= limit <= 500 or not isinstance(body.get("reason"), str):
+    sync_contract.decimal_cursor(cursor.get("stream_epoch"), "stream_epoch", positive=True)
+    after = sync_contract.decimal_cursor(cursor.get("scan_seq"), "scan_seq")
+    limit = body.get("limit")
+    reasons = {"session_start", "app_resume", "websocket_hint", "websocket_reconnect", "foreground_reconcile", "manual_refresh", "after_mutation"}
+    if type(limit) is not int or not 1 <= limit <= 500 or body.get("reason") not in reasons:
         raise InvalidParams("sync.delta_body_invalid")
     with get_store(request).connect() as conn:
-        binding = conn.execute("SELECT 1 FROM sync_v2_bindings WHERE owner_did = ? AND device_id = ?", (owner, device_id)).fetchone()
+        conn.execute("BEGIN IMMEDIATE")
+        binding = conn.execute("SELECT * FROM sync_v2_bindings WHERE owner_did=? AND device_id=? AND account_id=?", (owner, device_id, account_id)).fetchone()
         if not binding:
             raise InvalidParams("SYNC_BOOTSTRAP_REQUIRED")
-        rows = conn.execute(
-            "SELECT * FROM sync_events WHERE owner_did = ? AND event_seq > ? ORDER BY event_seq LIMIT ?",
-            (owner, after, limit + 1),
-        ).fetchall()
-    has_more = len(rows) > limit
-    rows = rows[:limit]
-    events = [_sync_v2_event(row, owner=owner, account_id=account_id) for row in rows]
-    next_seq = events[-1]["event_seq"] if events else str(after)
-    return {
-        "mode": "delta",
-        "server_time": now_iso(),
-        "events": events,
-        "next_cursor": {"stream_epoch": "1", "scan_seq": next_seq},
-        "has_more": has_more,
-        "recovery": None,
-        "warnings": ["single_device_pull_only"],
-    }
+        epoch = str(binding["stream_epoch"])
+        if cursor["stream_epoch"] != epoch:
+            if _negotiation_snapshot_enabled(
+                conn,
+                account_id=account_id,
+                device_id=device_id,
+                auth_generation=_auth_generation(request),
+                client_instance_id=binding["client_instance_id"],
+            ):
+                _, highest, _ = _log_gap(conn, owner)
+                issued = _issue_snapshot_recovery(
+                    conn,
+                    request,
+                    owner=owner,
+                    account_id=account_id,
+                    device_id=device_id,
+                    auth_generation=_auth_generation(request),
+                    client_instance_id=binding["client_instance_id"],
+                    epoch=epoch,
+                    highest=highest,
+                )
+                return {
+                    "mode": "compact_recovery_required",
+                    "server_time": issued["server_time"],
+                    "events": [],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "recovery": issued["recovery"],
+                }
+            raise InvalidParams("sync.cursor_epoch_mismatch")
+        highest = conn.execute("SELECT COALESCE(MAX(event_seq),0) FROM sync_events WHERE owner_did=?", (owner,)).fetchone()[0]
+        if after > highest:
+            raise InvalidParams("sync.cursor_ahead")
+        rows = conn.execute("SELECT * FROM sync_events WHERE owner_did=? AND event_seq>? ORDER BY event_seq LIMIT ?", (owner, after, limit + 1)).fetchall()
+        has_more = len(rows) > limit
+        scanned = rows[:limit]
+        events = []
+        for expected, row in enumerate(scanned, after + 1):
+            if row["event_seq"] != expected:
+                if _negotiation_snapshot_enabled(
+                    conn,
+                    account_id=account_id,
+                    device_id=device_id,
+                    auth_generation=_auth_generation(request),
+                    client_instance_id=binding["client_instance_id"],
+                ):
+                    issued = _issue_snapshot_recovery(
+                        conn,
+                        request,
+                        owner=owner,
+                        account_id=account_id,
+                        device_id=device_id,
+                        auth_generation=_auth_generation(request),
+                        client_instance_id=binding["client_instance_id"],
+                        epoch=epoch,
+                        highest=int(highest),
+                    )
+                    return {
+                        "mode": "compact_recovery_required",
+                        "server_time": issued["server_time"],
+                        "events": [],
+                        "next_cursor": None,
+                        "has_more": False,
+                        "recovery": issued["recovery"],
+                    }
+                raise InvalidParams("sync.retained_log_incomplete")
+            event = _sync_v2_event(row, owner=owner, account_id=account_id, conn=conn, epoch=epoch)
+            if event["event_type"] == "message.created" and event["payload"]["message_kind"] == "group_plain":
+                try:
+                    sync_contract.group_source(conn, owner, event["payload"]["group_did"])
+                except Unauthorized:
+                    # Current membership governs network reads. Scan past an
+                    # invisible message without suppressing terminal state.
+                    continue
+            events.append(event)
+        next_seq = str(scanned[-1]["event_seq"]) if scanned else str(after)
+    return {"mode": "delta", "server_time": now_iso(), "events": events,
+            "next_cursor": {"stream_epoch": epoch, "scan_seq": next_seq}, "has_more": has_more,
+            "recovery": None, "warnings": ["single_device_pull_only"]}
 
 
 def _sync_delta_v1(params: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -1769,7 +2138,10 @@ def _sync_delta_v1(params: dict[str, Any], request: Request) -> dict[str, Any]:
     rows = rows[:limit]
     events = []
     for row in rows:
+        if row["event_type"] == "message.read_state_updated":
+            continue  # This event belongs to the explicit v2 reducer contract.
         payload = _load(row["payload_json"])
+        payload.pop("_sync_group", None)
         message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
         thread = payload.get("thread") if isinstance(payload.get("thread"), dict) else {}
         aggregate_id = (
@@ -1787,7 +2159,7 @@ def _sync_delta_v1(params: dict[str, Any], request: Request) -> dict[str, Any]:
             aggregate_kind = "group_message"
         elif stored_event_type.startswith("group."):
             aggregate_kind = "group"
-        elif stored_event_type.startswith("read_state."):
+        elif stored_event_type.startswith("read_state.") or stored_event_type == "message.read_state_updated":
             aggregate_kind = "read_state"
         else:
             aggregate_kind = "event"
@@ -1807,7 +2179,7 @@ def _sync_delta_v1(params: dict[str, Any], request: Request) -> dict[str, Any]:
                 "payload": payload,
             }
         )
-    next_seq = events[-1]["event_seq"] if events else after
+    next_seq = str(rows[-1]["event_seq"]) if rows else str(after)
     return {
         "owner_did": owner,
         "owner_subject_id": owner,
@@ -1900,72 +2272,61 @@ def _thread_after_v1(params: dict[str, Any], request: Request) -> dict[str, Any]
     }
 
 
-def _hydrated_sync_v2_message(conn: Any, *, owner: str, message_id: str) -> dict[str, Any] | None:
-    direct = conn.execute(
-        """
-        SELECT m.*, v.read_at FROM direct_messages m
-        JOIN direct_message_views v ON v.message_id = m.message_id
-        WHERE v.owner_did = ? AND m.message_id = ?
-        """,
-        (owner, message_id),
-    ).fetchone()
-    if direct:
-        message = _direct_message_result(direct, owner)
-        message["thread_kind"] = "direct"
-        message["client_msg_id"] = message.get("operation_id") or message_id
-        return message
-    hosted = conn.execute(
-        """
-        SELECT m.*, m.group_event_seq AS server_seq
-        FROM hosted_group_messages m
-        JOIN hosted_group_members member ON member.group_did = m.group_did
-        WHERE member.agent_did = ? AND member.status = 'active' AND m.message_id = ?
-        """,
-        (owner, message_id),
-    ).fetchone()
-    if hosted:
-        message = _group_message_result(hosted)
-        message["thread_kind"] = "group"
+def _ordinary_sync_message(conn, row, owner: str, *, kind: str) -> dict[str, Any]:
+    projected = _direct_message_result(row, owner) if kind == "direct" else _group_message_result(row)
+    fields = {"message_id", "server_seq", "sender_did", "receiver_did", "group_did", "content_type", "content", "body", "type", "created_at", "sent_at", "received_at", "read_at", "is_read", "operation_id"}
+    message = {key: value for key, value in projected.items() if key in fields}
+    message.update(thread_kind=kind, client_msg_id=row["message_id"], server_seq=str(row["server_seq"]), accepted_at=row["created_at"])
+    if kind == "direct":
+        peer = row["recipient_did"] if row["sender_did"] == owner else row["sender_did"]
+        message["conversation_ref"] = sync_contract.conversation_ref(conn, owner, peer)
+    else:
         message["receiver_did"] = owner
-        message["client_msg_id"] = message.get("operation_id") or message_id
-        return message
-    legacy = conn.execute(
-        """
-        SELECT m.* FROM group_messages m
-        JOIN group_members member ON member.group_did = m.group_did
-        WHERE member.member_did = ? AND m.message_id = ?
-        """,
-        (owner, message_id),
-    ).fetchone()
-    if legacy:
-        message = _group_message_result(legacy)
-        message["thread_kind"] = "group"
-        message["receiver_did"] = owner
-        message["client_msg_id"] = message.get("operation_id") or message_id
-        return message
-    return None
+        message["group_event_seq"] = str(row["server_seq"])
+        if "receipt_json" in row.keys():
+            message["group_receipt"] = _load(row["receipt_json"])
+        message["wire_profile"] = row["wire_profile"] if "wire_profile" in row.keys() else "anp.group.base.v1"
+    return message
+
+
+def _hydrated_sync_v2_message(conn: Any, *, owner: str, message_id: str, kind: str, group_did: str | None = None) -> dict[str, Any] | None:
+    if kind == "direct":
+        row = conn.execute("""SELECT m.*, v.read_at FROM direct_messages m JOIN direct_message_views v ON v.message_id=m.message_id
+            WHERE v.owner_did=? AND m.message_id=?""", (owner, message_id)).fetchone()
+    elif kind == "group" and group_did:
+        try:
+            table, sequence = sync_contract.group_source(conn, owner, group_did)
+        except Unauthorized:
+            return None
+        owner_clause = " AND owner_did=?" if table == "group_message_views" else ""
+        time_column = "accepted_at" if table == "group_message_views" else "created_at"
+        values = (group_did, message_id, owner) if owner_clause else (group_did, message_id)
+        row = conn.execute(f"SELECT *, {sequence} AS server_seq, {time_column} AS created_at FROM {table} WHERE group_did=? AND message_id=?{owner_clause}", values).fetchone()
+    else:
+        return None
+    return _ordinary_sync_message(conn, row, owner, kind=kind) if row else None
 
 
 def message_get_batch_v2(params: dict[str, Any], request: Request) -> dict[str, Any]:
-    owner, _, _ = _sync_v2_identity(request)
+    owner, _, _ = _sync_v2_identity(request, params)
     body = params.get("_anp_body") if isinstance(params.get("_anp_body"), dict) else params
     if set(body) != {"event_ids"} or not isinstance(body.get("event_ids"), list):
         raise InvalidParams("message.get_batch_body_invalid")
     event_ids = body["event_ids"]
-    if not 1 <= len(event_ids) <= 100 or len(set(event_ids)) != len(event_ids) or not all(isinstance(item, str) and item for item in event_ids):
+    if not 1 <= len(event_ids) <= 100 or not all(isinstance(item, str) and item and item.strip() == item for item in event_ids) or len(set(event_ids)) != len(event_ids):
         raise InvalidParams("message.get_batch_event_ids_invalid")
-    items: list[dict[str, Any]] = []
-    unavailable: list[str] = []
+    items, unavailable = [], []
     with get_store(request).connect() as conn:
         for event_id in event_ids:
-            event = conn.execute(
-                "SELECT payload_json FROM sync_events WHERE owner_did = ? AND event_id = ?",
-                (owner, event_id),
-            ).fetchone()
-            payload = _load(event["payload_json"]) if event else {}
-            message_ref = payload.get("message") if isinstance(payload.get("message"), dict) else {}
-            message_id = message_ref.get("message_id") or payload.get("message_id")
-            message = _hydrated_sync_v2_message(conn, owner=owner, message_id=str(message_id)) if message_id else None
+            event = conn.execute("SELECT * FROM sync_events WHERE owner_did=? AND event_id=?", (owner, event_id)).fetchone()
+            original = _load(event["payload_json"]) if event else {}
+            ref = original.get("message") if isinstance(original.get("message"), dict) else {}
+            message_id = ref.get("message_id") or original.get("message_id")
+            kind = "group" if event and str(event["event_type"]).startswith("group.message.") else "direct" if event and str(event["event_type"]).startswith("direct.message.") else None
+            group_did = ref.get("group_did") or original.get("group_did") or original.get("thread", {}).get("group_did")
+            message = _hydrated_sync_v2_message(conn, owner=owner, message_id=str(message_id), kind=kind, group_did=group_did) if message_id and kind else None
+            if message is not None and ref.get("server_seq") is not None and str(ref["server_seq"]) != message["server_seq"]:
+                message = None
             if message is None:
                 unavailable.append(event_id)
             else:
@@ -1974,51 +2335,120 @@ def message_get_batch_v2(params: dict[str, Any], request: Request) -> dict[str, 
 
 
 def thread_after_v2(params: dict[str, Any], request: Request) -> dict[str, Any]:
-    owner, _, _ = _sync_v2_identity(request)
+    owner, _, _ = _sync_v2_identity(request, params)
     body = params.get("_anp_body") if isinstance(params.get("_anp_body"), dict) else params
     if set(body) != {"thread_key", "after_server_seq", "limit"}:
         raise InvalidParams("sync.thread_after_body_invalid")
-    thread_key = body.get("thread_key")
-    if not isinstance(thread_key, str) or not thread_key:
+    key = body.get("thread_key")
+    if not isinstance(key, str) or not key:
         raise InvalidParams("thread_key_required")
-    if thread_key.startswith("direct:"):
-        mapped = {
-            "thread": {"kind": "direct", "peer_did": thread_key.removeprefix("direct:")},
-            "after_server_seq": body.get("after_server_seq"),
-            "limit": body.get("limit"),
-        }
-        thread_kind = "direct"
-    else:
-        group_did = thread_key.removeprefix("group:")
-        mapped = {
-            "thread": {"kind": "group", "group_did": group_did},
-            "after_server_seq": body.get("after_server_seq"),
-            "limit": body.get("limit"),
-        }
-        thread_kind = "group"
-    result = _thread_after_v1(mapped, request)
-    messages = []
-    for item in result["messages"]:
-        message = dict(item)
-        message["thread_kind"] = thread_kind
-        message["client_msg_id"] = message.get("operation_id") or message.get("message_id")
-        if thread_kind == "direct":
-            message.setdefault("receiver_did", message.get("recipient_did") or owner)
+    after = sync_contract.decimal_cursor(body.get("after_server_seq"), "after_server_seq")
+    if after > 2**63 - 1 or type(body.get("limit")) is not int or not 1 <= body["limit"] <= 500:
+        raise InvalidParams("sync.thread_after_body_invalid")
+    limit = body["limit"]
+    with get_store(request).connect() as conn:
+        if key.startswith("did:"):
+            kind = "group"
+            table, sequence = sync_contract.group_source(conn, owner, key)
+            owner_clause = " AND owner_did=?" if table == "group_message_views" else ""
+            time_column = "accepted_at" if table == "group_message_views" else "created_at"
+            values = (key, after, owner, limit + 1) if owner_clause else (key, after, limit + 1)
+            rows = conn.execute(f"SELECT *, {sequence} AS server_seq, {time_column} AS created_at FROM {table} WHERE group_did=? AND {sequence}>?{owner_clause} ORDER BY {sequence} LIMIT ?", values).fetchall()
         else:
-            message.setdefault("receiver_did", owner)
-        messages.append(message)
-    return {
-        "messages": messages,
-        "next_after_server_seq": result["next_after_server_seq"],
-        "has_more": result["has_more"],
-        "warnings": ["single_device_pull_only"],
-    }
+            kind = "direct"
+            peer = sync_contract.conversation_peer(conn, owner, key)
+            rows = conn.execute("""SELECT m.*, v.read_at FROM direct_messages m JOIN direct_message_views v ON v.message_id=m.message_id
+                WHERE v.owner_did=? AND v.peer_did=? AND m.server_seq>? ORDER BY m.server_seq LIMIT ?""", (owner, peer, after, limit + 1)).fetchall()
+        has_more = len(rows) > limit
+        messages = [_ordinary_sync_message(conn, row, owner, kind=kind) for row in rows[:limit]]
+    return {"messages": messages, "next_after_server_seq": messages[-1]["server_seq"] if messages else str(after),
+            "has_more": has_more, "warnings": ["single_device_pull_only"]}
 
 
 def thread_after(params: dict[str, Any], request: Request) -> dict[str, Any]:
     if _sync_v2_profile(params):
         return thread_after_v2(params, request)
     return _thread_after_v1(params, request)
+
+
+def _expired(value: str) -> bool:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")) <= datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        return True
+
+
+def sync_snapshot(params: dict[str, Any], request: Request) -> dict[str, Any]:
+    owner, account_id, device_id = _sync_v2_identity(request, params)
+    body = params.get("_anp_body") if isinstance(params.get("_anp_body"), dict) else params
+    keys = set(body)
+    if keys == {"recovery_id", "token"}:
+        page_ref = None
+    elif keys == {"recovery_id", "token", "page_ref"}:
+        page_ref = body.get("page_ref")
+        if not isinstance(page_ref, str) or not page_ref:
+            raise SyncProtocolError("sync.invalid_request", details={"field": "page_ref"})
+    else:
+        raise SyncProtocolError("sync.invalid_request", details={"reason": "sync.snapshot_body_invalid"})
+    recovery_id = body.get("recovery_id")
+    token = body.get("token")
+    if not isinstance(recovery_id, str) or not recovery_id or not isinstance(token, str) or not token:
+        raise SyncProtocolError("sync.invalid_request", details={"reason": "sync.snapshot_body_invalid"})
+    auth_generation = _auth_generation(request)
+    with get_store(request).connect() as conn:
+        row = conn.execute("SELECT * FROM sync_snapshot_sessions WHERE recovery_id=?", (recovery_id,)).fetchone()
+        if row is None:
+            raise SyncProtocolError("sync.recovery_token_invalid", code=4216)
+        if (
+            row["owner_did"] != owner
+            or row["account_id"] != account_id
+            or row["device_id"] != device_id
+            or int(row["auth_generation"]) != auth_generation
+        ):
+            raise SyncProtocolError("sync.recovery_token_invalid", code=4216, details={"reason": "subject_mismatch"})
+        if row["token_hash"] != standard_sync.token_hash(token):
+            raise SyncProtocolError("sync.recovery_token_invalid", code=4216)
+        if _expired(row["expires_at"]):
+            raise SyncProtocolError("sync.recovery_token_expired", code=4217)
+        pages = _load(row["pages_json"])
+        manifest = _load(row["manifest_json"])
+        if page_ref is None:
+            page = pages[0]
+            include_manifest = True
+        else:
+            include_manifest = False
+            page = next((item for item in pages if item.get("page_ref") == page_ref), None)
+            if page is None:
+                raise SyncProtocolError("sync.recovery_token_invalid", code=4216, details={"field": "page_ref"})
+            standard_sync.parse_page_ref(
+                request.app.state.snapshot_page_ref_key,
+                page_ref,
+                page["claims"],
+            )
+        page_body = {
+            "section": page["section"],
+            "items": page["items"],
+            "returned_items": page["returned_items"],
+            "returned_encoded_bytes": page["returned_encoded_bytes"],
+            "page_digest": page["page_digest"],
+            "has_more": page["has_more"],
+            "next_page_ref": page["next_page_ref"],
+        }
+        binding = {
+            "mode": "compact_recovery",
+            "recovery_id": recovery_id,
+            "account_id": account_id,
+            "device_id": device_id,
+            "device_auth_generation": str(auth_generation),
+            "client_instance_id": row["client_instance_id"],
+            "server_time": now_iso(),
+            "snapshot_schema": 3,
+            "snapshot_delivery": "paged_v1",
+            "snapshot_cursor": {"stream_epoch": row["stream_epoch"], "scan_seq": row["snapshot_scan_seq"]},
+        }
+        if include_manifest:
+            return {**binding, "manifest": manifest, "page": page_body}
+        return {**binding, "manifest_digest": manifest["manifest_digest"], "page": page_body}
 
 
 def _group_get_info_dispatch(params: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -2139,10 +2569,48 @@ def _group_members_dispatch(params: dict[str, Any], request: Request) -> dict[st
 
 
 def _group_list_dispatch(params: dict[str, Any], request: Request) -> dict[str, Any]:
-    legacy = group_list(params, request)
-    hosted = hosted_group_list(params, request)
+    try:
+        limit = int(params.get("limit", 50))
+    except (TypeError, ValueError) as exc:
+        raise InvalidParams("limit_invalid") from exc
+    if limit < 1 or limit > 100:
+        raise InvalidParams("limit_too_large")
+    cursor = params.get("cursor")
+    offset = 0
+    if cursor is not None:
+        if not isinstance(cursor, str) or not cursor.startswith("groups:"):
+            raise InvalidParams("group.local_cursor_invalid")
+        try:
+            offset = int(cursor.removeprefix("groups:"))
+        except ValueError as exc:
+            raise InvalidParams("group.local_cursor_invalid") from exc
+        if offset < 0:
+            raise InvalidParams("group.local_cursor_invalid")
+    unpaged = {**params, "limit": 100}
+    unpaged.pop("cursor", None)
+    legacy = group_list(unpaged, request)
+    hosted = hosted_group_list(unpaged, request)
     groups = [*hosted, *legacy]
-    return {"groups": groups, "total": len(groups), "source": "local_projection"}
+    for group in groups:
+        if "my_role" not in group and "member_role" in group:
+            group["my_role"] = group["member_role"]
+        if "member_status" not in group and "membership_status" in group:
+            group["member_status"] = group["membership_status"]
+    total = len(groups)
+    if offset > total:
+        raise InvalidParams("group.local_cursor_invalid")
+    page = groups[offset : offset + limit]
+    next_offset = offset + len(page)
+    has_more = next_offset < total
+    result = {
+        "groups": page,
+        "total": total,
+        "has_more": has_more,
+        "source": "local_projection",
+    }
+    if has_more:
+        result["next_cursor"] = f"groups:{next_offset}"
+    return result
 
 
 def _group_messages_dispatch(params: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -2194,6 +2662,7 @@ MESSAGE_HANDLERS = {
     "read_state.mark_read": mark_read,
     "sync.delta": sync_delta,
     "sync.bootstrap": sync_bootstrap_v2,
+    "sync.snapshot": sync_snapshot,
     "sync.thread_after": thread_after,
     "message.get_batch": message_get_batch_v2,
     "group.get_info": _group_get_info_dispatch,

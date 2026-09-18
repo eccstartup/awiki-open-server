@@ -252,3 +252,33 @@ async def test_group_read_state_uses_thread_watermark_without_sync_event(client)
         token=alice_token,
     )
     assert after_read_delta["result"]["events"] == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_individual_reads_advance_only_the_contiguous_owner_prefix(client):
+    owner, owner_token = await register(client, 'read-prefix-owner')
+    peer, peer_token = await register(client, 'read-prefix-peer')
+    stranger, stranger_token = await register(client, 'read-prefix-stranger')
+    sent = [await rpc(client, '/im/rpc', 'direct.send', {'to':owner, 'text':f'prefix {i}'}, token=peer_token) for i in range(3)]
+    ids = [item['result']['message_id'] for item in sent]
+    app = client._transport.app
+    def state():
+        with app.state.store.connect() as conn:
+            row = conn.execute('SELECT * FROM thread_read_states WHERE owner_did=? AND thread_id=?', (owner, f'direct:{peer}')).fetchone()
+            events = conn.execute("SELECT COUNT(*) FROM sync_events WHERE owner_did=? AND event_type='message.read_state_updated'", (owner,)).fetchone()[0]
+            return dict(row) if row else None, events
+    rejected = await rpc(client, '/im/rpc', 'inbox.mark_read', {'message_ids':ids}, token=stranger_token)
+    assert rejected['result']['updated_count'] == 0
+    await rpc(client, '/im/rpc', 'inbox.mark_read', {'message_ids':[ids[2]]}, token=owner_token)
+    assert state() == (None, 0)
+    await rpc(client, '/im/rpc', 'inbox.mark_read', {'message_ids':[ids[0]]}, token=owner_token)
+    first, count = state()
+    assert first['read_up_to_seq'] == sent[0]['result']['server_seq']
+    assert count == 1
+    await rpc(client, '/im/rpc', 'inbox.mark_read', {'message_ids':[ids[1]]}, token=owner_token)
+    final, count = state()
+    assert final['read_up_to_seq'] == sent[2]['result']['server_seq']
+    assert final['read_message_id'] == ids[2]
+    assert final['state_version'] == first['state_version'] + 1 and count == 2
+    await rpc(client, '/im/rpc', 'inbox.mark_read', {'message_ids':ids}, token=owner_token)
+    assert state() == (final, count)

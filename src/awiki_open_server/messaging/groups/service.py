@@ -25,6 +25,7 @@ from awiki_open_server.messaging.groups.projection import (
     project_hosted_message_for_local_members,
     refresh_hosted_local_projections,
 )
+from awiki_open_server.messaging.groups.protocol import BASE_PROFILES, BASE_V2, require_group_protocol, validate_v2_shape
 from awiki_open_server.protocol.anp_adapter import build_content_digest
 from awiki_open_server.service_identity import validate_origin_proof_structure
 from awiki_open_server.shared import runtime
@@ -138,8 +139,9 @@ def _request_context(
         raise Unauthorized("missing_origin_proof")
     if auth.get("scheme") != "anp-rfc9421-origin-proof-v1":
         raise Unauthorized("invalid_origin_proof_scheme")
-    if meta.get("profile") != GROUP_PROFILE:
+    if meta.get("profile") not in BASE_PROFILES:
         raise InvalidParams("anp_meta_profile_mismatch", data={"expected": GROUP_PROFILE, "actual": meta.get("profile")})
+    validate_v2_shape(method, meta, body)
     if meta.get("security_profile") != TRANSPORT_SECURITY:
         raise InvalidParams(
             "anp_meta_security_profile_mismatch",
@@ -231,29 +233,37 @@ def _merge_patch(document: Any, patch: Any) -> Any:
 def _operation_replay(conn: Any, context: GroupRequest, scope: str) -> dict[str, Any] | None:
     row = conn.execute(
         """
-        SELECT payload_digest, result_json FROM group_operations
+        SELECT payload_digest, result_json, wire_profile FROM group_operations
         WHERE sender_did = ? AND group_scope = ? AND method = ? AND operation_id = ?
         """,
         (context.sender_did, scope, context.method, context.operation_id),
     ).fetchone()
     if not row:
         return None
-    if row["payload_digest"] != context.payload_digest:
+    if row["wire_profile"] != context.meta["profile"] or row["payload_digest"] != context.payload_digest:
         raise Conflict(
             "group.operation_id_conflict",
             data={"operation_id": context.operation_id, "method": context.method},
         )
     result = _load(row["result_json"])
+    _standard_v2_acceptance(context, result)
     result["idempotent_replay"] = True
     return result
 
 
+def _standard_v2_acceptance(context: GroupRequest, result: dict[str, Any]) -> None:
+    if context.meta["profile"] == "anp.group.base.v2":
+        result.update({"accepted": True, "final_acceptance": True, "operation_id": context.operation_id})
+        result["accepted_at"] = result["group_receipt"]["accepted_at"]
+
+
 def _store_operation(conn: Any, context: GroupRequest, scope: str, result: dict[str, Any], created_at: str) -> None:
+    _standard_v2_acceptance(context, result)
     conn.execute(
         """
         INSERT INTO group_operations(
-          sender_did, group_scope, method, operation_id, payload_digest, result_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          sender_did, group_scope, method, operation_id, payload_digest, result_json, created_at, wire_profile
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             context.sender_did,
@@ -263,14 +273,18 @@ def _store_operation(conn: Any, context: GroupRequest, scope: str, result: dict[
             context.payload_digest,
             _json(result),
             created_at,
+            context.meta["profile"],
         ),
     )
 
 
-def _group_row(conn: Any, group_did: str) -> Any:
+def _group_row(conn: Any, group_did: str, *, profile: str | None = None, writing: bool = False) -> Any:
+    if writing and not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     row = conn.execute("SELECT * FROM hosted_groups WHERE group_did = ?", (group_did,)).fetchone()
     if not row:
         raise NotFound("group.not_found")
+    require_group_protocol(row, profile, writing=writing)
     return row
 
 
@@ -457,6 +471,7 @@ def hosted_group_create(params: dict[str, Any], request: Request) -> dict[str, A
         group_id=group_id,
         service_endpoint=settings.anp_service_endpoint,
         service_did=settings.service_did,
+        profile=context.meta["profile"],
     )
     group_did = str(document["id"])
     key_path = persist_group_private_key(settings.data_dir / "group-keys", group_id, private_key_pem)
@@ -471,10 +486,10 @@ def hosted_group_create(params: dict[str, Any], request: Request) -> dict[str, A
                 """
                 INSERT INTO hosted_groups(
                   group_did, host_service_did, creator_did, profile_json, policy_json,
-                  group_state_version, group_event_seq, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
+                  group_state_version, group_event_seq, created_at, updated_at, wire_profile
+                ) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?)
                 """,
-                (group_did, settings.service_did, context.sender_did, _json(profile), _json(policy), created_at, created_at),
+                (group_did, settings.service_did, context.sender_did, _json(profile), _json(policy), created_at, created_at, context.meta["profile"]),
             )
             conn.execute(
                 """
@@ -567,6 +582,7 @@ def hosted_group_get_info(params: dict[str, Any], request: Request) -> dict[str,
     public = _public_request(request)
     meta = params.get("_anp_meta") if isinstance(params.get("_anp_meta"), dict) else {}
     body = params.get("_anp_body") if isinstance(params.get("_anp_body"), dict) else params
+    validate_v2_shape("group.get_info", meta, body)
     sender_did: str | None
     if public:
         sender_did = meta.get("sender_did") if isinstance(meta.get("sender_did"), str) else None
@@ -579,7 +595,7 @@ def hosted_group_get_info(params: dict[str, Any], request: Request) -> dict[str,
     else:
         sender_did = current_did(request)
     with get_store(request).connect() as conn:
-        group = _group_row(conn, group_did)
+        group = _group_row(conn, group_did, profile=meta.get("profile"))
         member = (
             conn.execute(
                 """
@@ -615,6 +631,8 @@ def hosted_group_get_info(params: dict[str, Any], request: Request) -> dict[str,
                     (group_did,),
                 ).fetchall()
             ]
+    if member_list is not None and group["wire_profile"] == BASE_V2:
+        member_list = [{"member_did": item["agent_did"], "role": item["role"], "status": item["status"], "joined_at": item["joined_at"]} for item in member_list]
     profile = _load(group["profile_json"])
     discoverability = profile.get("discoverability", "public")
     local_projection = meta.get("profile") == "anp.group.local.v1" and not public
@@ -650,7 +668,10 @@ def hosted_group_list(params: dict[str, Any], request: Request) -> list[dict[str
     with get_store(request).connect() as conn:
         rows = conn.execute(
             """
-            SELECT g.*, m.role AS member_role, m.status AS membership_status
+            SELECT g.*, m.role AS member_role, m.status AS membership_status,
+                   (SELECT COUNT(*) FROM hosted_group_members active
+                    WHERE active.group_did = g.group_did AND active.status = 'active')
+                   AS member_count
             FROM hosted_groups g
             JOIN hosted_group_members m ON m.group_did = g.group_did
             WHERE m.agent_did = ? AND m.status = 'active'
@@ -669,6 +690,7 @@ def hosted_group_list(params: dict[str, Any], request: Request) -> list[dict[str
             "group_policy": _load(row["policy_json"]),
             "member_role": row["member_role"],
             "membership_status": row["membership_status"],
+            "member_count": row["member_count"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -678,9 +700,14 @@ def hosted_group_list(params: dict[str, Any], request: Request) -> list[dict[str
     with get_store(request).connect() as conn:
         projection_rows = conn.execute(
             """
-            SELECT * FROM group_views
-            WHERE owner_did = ? AND membership_status = 'active'
-            ORDER BY updated_at DESC, group_did
+            SELECT views.*,
+                   (SELECT COUNT(*) FROM group_member_views members
+                    WHERE members.owner_did = views.owner_did
+                      AND members.group_did = views.group_did
+                      AND members.status = 'active') AS member_count
+            FROM group_views views
+            WHERE views.owner_did = ? AND views.membership_status = 'active'
+            ORDER BY views.updated_at DESC, views.group_did
             LIMIT ?
             """,
             (owner, limit),
@@ -695,6 +722,7 @@ def hosted_group_list(params: dict[str, Any], request: Request) -> list[dict[str
             "group_policy": _load(row["policy_json"]),
             "member_role": row["member_role"],
             "membership_status": row["membership_status"],
+            "member_count": row["member_count"],
             "updated_at": row["updated_at"],
         }
         for row in projection_rows
@@ -730,10 +758,11 @@ def projected_group_list_members(params: dict[str, Any], request: Request) -> li
     owner = current_did(request)
     group_did = _require_string(params.get("group_did"), "group_did_required")
     with get_store(request).connect() as conn:
-        if not conn.execute(
-            "SELECT 1 FROM group_views WHERE owner_did = ? AND group_did = ? AND membership_status = 'active'",
+        group = conn.execute(
+            "SELECT * FROM group_views WHERE owner_did = ? AND group_did = ? AND membership_status = 'active'",
             (owner, group_did),
-        ).fetchone():
+        ).fetchone()
+        if group is None:
             raise NotFound("group.projection_not_found")
         rows = conn.execute(
             """
@@ -743,7 +772,12 @@ def projected_group_list_members(params: dict[str, Any], request: Request) -> li
             """,
             (owner, group_did),
         ).fetchall()
-    return [{**dict(row), "member_did": row["agent_did"]} for row in rows]
+    members = [{**dict(row), "member_did": row["agent_did"]} for row in rows]
+    if group["wire_profile"] == BASE_V2:
+        for member in members:
+            member.pop("member_handle", None)
+            member.pop("handle_binding_generation", None)
+    return members
 
 
 def projected_group_list_messages(params: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -818,7 +852,8 @@ def _membership_mutation(
     group_did = context.target_did
     created_at = now_iso()
     with get_store(request).connect() as conn:
-        group = _group_row(conn, group_did)
+        group = _group_row(conn, group_did, profile=context.meta["profile"])
+        require_group_protocol(group, context.meta["profile"], writing=True)
         replay = _operation_replay(conn, context, group_did)
         if replay is not None:
             return replay
@@ -850,6 +885,18 @@ def _membership_mutation(
             if role not in ROLE_LEVEL:
                 raise InvalidParams("group.role_invalid")
             added_by = context.sender_did
+    home_service_did = _home_service_did(request, target_did)
+    with get_store(request).connect() as conn:
+        group = _group_row(conn, group_did, profile=context.meta["profile"], writing=True)
+        replay = _operation_replay(conn, context, group_did)
+        if replay is not None:
+            return replay
+        policy = _load(group["policy_json"])
+        if method == "group.join":
+            if policy["admission_mode"] != "open-join":
+                raise Unauthorized("group.policy_violation")
+        else:
+            _require_permission(group, _active_member(conn, group_did, context.sender_did), "add")
         existing = conn.execute(
             "SELECT status FROM hosted_group_members WHERE group_did = ? AND agent_did = ?",
             (group_did, target_did),
@@ -864,7 +911,6 @@ def _membership_mutation(
         )
         if active_count >= int(policy["max_members"]):
             raise InvalidParams("group.max_members_exceeded")
-        home_service_did = _home_service_did(request, target_did)
         conn.execute(
             """
             INSERT INTO hosted_group_members(
@@ -977,7 +1023,7 @@ def _end_membership(params: dict[str, Any], request: Request, *, method: str) ->
     group_did = context.target_did
     changed_at = now_iso()
     with get_store(request).connect() as conn:
-        group = _group_row(conn, group_did)
+        group = _group_row(conn, group_did, profile=context.meta["profile"], writing=True)
         replay = _operation_replay(conn, context, group_did)
         if replay is not None:
             return replay
@@ -993,16 +1039,14 @@ def _end_membership(params: dict[str, Any], request: Request, *, method: str) ->
             _active_member(conn, group_did, target_did)
             status = "removed"
             event_type = "member-removed"
+        if context.meta["profile"] == BASE_V2:
+            ensure_outbox_capacity(conn, get_settings(request), group_did=group_did, management_operation=True)
         conn.execute(
             "UPDATE hosted_group_members SET status = ?, ended_at = ? WHERE group_did = ? AND agent_did = ?",
             (status, changed_at, group_did, target_did),
         )
-        ensure_outbox_capacity(
-            conn,
-            get_settings(request),
-            group_did=group_did,
-            management_operation=True,
-        )
+        if context.meta["profile"] != BASE_V2:
+            ensure_outbox_capacity(conn, get_settings(request), group_did=group_did, management_operation=True)
         state_version = int(group["group_state_version"]) + 1
         event_seq = int(group["group_event_seq"]) + 1
         conn.execute(
@@ -1052,6 +1096,8 @@ def _end_membership(params: dict[str, Any], request: Request, *, method: str) ->
         )
         _store_operation(conn, context, group_did, result, changed_at)
         _sync_active_members(conn, group_did, f"group.{event_type}", event)
+        if context.meta["profile"] == BASE_V2 and runtime._user_exists(conn, target_did):
+            runtime.add_sync_event(conn, target_did, f"group.{event_type}", event)
         refresh_hosted_local_projections(conn, get_settings(request), group_did, updated_at=changed_at)
         enqueue_state_changed(
             conn,
@@ -1093,9 +1139,10 @@ def hosted_group_rebind_member(params: dict[str, Any], request: Request) -> dict
     if binding.binding_generation != requested_generation:
         raise InvalidParams("group.binding_generation_mismatch")
 
+    new_home_service_did = _home_service_did(request, new_did)
     changed_at = now_iso()
     with get_store(request).connect() as conn:
-        group = _group_row(conn, group_did)
+        group = _group_row(conn, group_did, profile=context.meta["profile"], writing=True)
         replay = _operation_replay(conn, context, group_did)
         if replay is not None:
             return replay
@@ -1131,7 +1178,7 @@ def hosted_group_rebind_member(params: dict[str, Any], request: Request) -> dict
             (
                 new_did,
                 binding.binding_generation,
-                _home_service_did(request, new_did),
+                new_home_service_did,
                 group_did,
                 binding.handle,
                 previous_did,
@@ -1218,7 +1265,7 @@ def _update_group(params: dict[str, Any], request: Request, *, method: str) -> d
     if not isinstance(patch, dict):
         raise InvalidParams(f"group.{patch_key}_required")
     with get_store(request).connect() as conn:
-        group = _group_row(conn, group_did)
+        group = _group_row(conn, group_did, profile=context.meta["profile"], writing=True)
         replay = _operation_replay(conn, context, group_did)
         if replay is not None:
             return replay
@@ -1324,7 +1371,7 @@ def hosted_group_send(params: dict[str, Any], request: Request) -> dict[str, Any
         )
     accepted_at = now_iso()
     with get_store(request).connect() as conn:
-        group = _group_row(conn, group_did)
+        group = _group_row(conn, group_did, profile=context.meta["profile"], writing=True)
         replay = _operation_replay(conn, context, group_did)
         if replay is not None:
             return replay
@@ -1358,8 +1405,8 @@ def hosted_group_send(params: dict[str, Any], request: Request) -> dict[str, Any
             """
             INSERT INTO hosted_group_messages(
               message_id, group_did, group_event_seq, sender_did, operation_id,
-              body_json, content_type, origin_auth_json, receipt_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              body_json, content_type, origin_auth_json, receipt_json, created_at, wire_profile, meta_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 message_id,
@@ -1372,6 +1419,8 @@ def hosted_group_send(params: dict[str, Any], request: Request) -> dict[str, Any
                 _json(context.auth),
                 _json(receipt),
                 accepted_at,
+                context.meta["profile"],
+                _json(context.meta),
             ),
         )
         result = {
@@ -1487,7 +1536,7 @@ def hosted_group_list_members(params: dict[str, Any], request: Request) -> list[
     owner = current_did(request)
     group_did = _require_string(params.get("group_did"), "group_did_required")
     with get_store(request).connect() as conn:
-        _group_row(conn, group_did)
+        group = _group_row(conn, group_did)
         _active_member(conn, group_did, owner)
         rows = conn.execute(
             """
@@ -1498,7 +1547,7 @@ def hosted_group_list_members(params: dict[str, Any], request: Request) -> list[
             """,
             (group_did,),
         ).fetchall()
-    return [
+    members = [
         {
             **dict(row),
             "member_did": row["agent_did"],
@@ -1511,6 +1560,12 @@ def hosted_group_list_members(params: dict[str, Any], request: Request) -> list[
         for row in rows
     ]
 
+
+    if group["wire_profile"] == BASE_V2:
+        for member in members:
+            member.pop("member_handle", None)
+            member.pop("handle_binding_generation", None)
+    return members
 
 def hosted_group_list_messages(params: dict[str, Any], request: Request) -> dict[str, Any]:
     owner = current_did(request)

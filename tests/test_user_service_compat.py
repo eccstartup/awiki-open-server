@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from awiki_open_server.protocol.anp_adapter import generate_service_http_signature_headers
 from tests.conftest import rpc
+from tests.helpers import register_with_key
 
 
 def test_user_compat_package_exports_handler_maps():
@@ -80,6 +84,39 @@ async def test_user_compat_did_auth_profile_and_handle_shape(client):
     user = await rpc(client, "/user-service/users/rpc", "get_by_did", {"did": did})
     assert user["result"]["did"] == did
     assert user["result"]["handle"] == "compat-alice"
+
+
+@pytest.mark.asyncio
+async def test_did_http_signature_get_me_issues_fresh_access_token(client):
+    did, old_token, private_key, document = await register_with_key(client, "signed-session")
+    endpoint = "http://testserver/user-service/v1/did-auth/rpc"
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "signed-session-refresh",
+        "method": "get_me",
+        "params": {},
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    base_headers = {"Content-Type": "application/json"}
+    signature_headers = generate_service_http_signature_headers(
+        did_document=document,
+        request_url=endpoint,
+        request_method="POST",
+        sign_callback=lambda value, _algorithm: private_key.sign(value),
+        headers=base_headers,
+        body=body,
+        keyid=f"{did}#key-1",
+    )
+
+    response = await client.post(
+        "/user-service/v1/did-auth/rpc",
+        content=body,
+        headers={**base_headers, **signature_headers},
+    )
+
+    result = response.json()["result"]
+    assert result["did"] == did
+    assert result["access_token"] != old_token
 
 
 @pytest.mark.asyncio

@@ -73,13 +73,16 @@ Community v1 不是商业集群的缩小部署包。基础群能力和标准跨�
 `X-AWiki-Client-Version` 只用于兼容观测，`X-API-Contract: user-service.v1` 只用于响应诊断；
 两者都不能改变协议语义。
 
-本地同步同时保留 `anp.sync.local.v1`，并支持受限的 `anp.sync.local.v2` wire contract。v2 仅供
-一个 DID 的唯一设备拉取和建立本地投影：`sync.bootstrap` 只返回 `tail_only`，并支持
-`sync.delta`、`message.get_batch`、`sync.thread_after`。不得支持一个 DID 多设备、第二个 client
-instance、设备间共享、snapshot/compact recovery 或多设备 cursor 合并；这些请求必须明确返回
-`not_supported`。这里的 profile v2 不是多设备能力声明。
+本地同步同时保留 `anp.sync.local.v1`，并支持标准 `anp.sync.local.v2`：显式协商
+`awiki.message-sync.explicit-negotiation.v1`、`sync.snapshot_paging.v1`、extended bootstrap、
+ordinary delta/hydration，以及 Schema 3 分页 Snapshot。空账号可以 tail-only；日志缺口或
+cursor 失效必须走 Snapshot 恢复，不能永远 tail-only。只服务一个 DID 的唯一设备/安装；第二
+设备或第二 client instance 返回 `not_supported`。P5/P6 加密 lane、prekey/KeyPackage 业务明确
+拒绝，不得静默裁剪 requested set 或虚报已实现。
 
 ## 5. Community Group v1
+
+此处 Community v1 是产品范围名。普通群 wire 支持 `anp.group.base.v2`，并保留显式 v1 群兼容；每群只有一个当前版本，不能因请求或对端错误隐式回退。旧群保持持续商业互通须先按 [受控迁移流程](docs/group-protocol-migration.zh-CN.md) 原地升级，保留 Group DID、密钥、当前成员及历史签名事实。未排空的旧 outbox 阻止切换，不能重新签成 v2。
 
 ### 5.1 权威模型
 
@@ -108,13 +111,15 @@ Group Host 是群状态唯一权威。每个托管群必须具有：
 | `group.add` | 有权限角色直接添加目标，成功后目标立即 active |
 | `group.remove` | 有权限角色移除成员，立即撤销发送权限 |
 | `group.leave` | 当前成员退出，立即撤销发送权限 |
-| `group.rebind_member` | Handle binding generation 变化后安全重绑定 DID |
+| `group.rebind_member` | 仅保留在显式 v1 群中；v2 不声明或实现此方法 |
 | `group.update_profile` | 有权限角色更新群名、描述等 profile |
 | `group.update_policy` | owner 更新标准群策略 |
 | `group.send` | active 成员发送本地或跨域普通群消息 |
 | `group.get/list/list_members/list_messages` | 本地或远端投影读取 |
 
 `group.add` 与 `group.join` 的成功结果就是最终成员资格，不存在后续确认步骤。
+
+v2 mutation 成功响应必须包含 `accepted=true`、`final_acceptance=true`、原 `operation_id`、`accepted_at` 及匹配的 Group Receipt/群版本/事件序号，供 Member Home 验证转发接受结果。重放旧缓存时可以补齐外层标准字段，但不能重新执行 mutation、改变序号或重签历史 Receipt。
 
 ### 5.3 禁止的邀请扩展
 
@@ -132,9 +137,9 @@ ANP P4 标准入群只有 `group.join` 和 `group.add`。Community v1：
 
 ### 5.4 身份与权限
 
-必须支持 DID-only membership 和 Handle-backed membership。
+v2 采用 DID-only membership，不接受 Handle/device/rebind 作为成员授权。v1 保留 DID-only membership 和已有 Handle-backed membership。
 
-Handle-backed 加入必须校验 WNS 归一化、active 状态、双向绑定和 binding generation，并保存当前 DID、Handle 与 generation。`group.rebind_member` 必须验证新 binding 后迁移成员身份，不能允许第三方劫持或复用旧 generation。
+v1 Handle-backed 加入必须校验 WNS 归一化、active 状态、双向绑定和 binding generation，并保存当前 DID、Handle 与 generation。`group.rebind_member` 必须验证新 binding 后迁移成员身份，不能允许第三方劫持或复用旧 generation。受控切换 v2 时冻结清单中的当前成员 DID；历史 Handle 字段仅保留审计用途，不再赋予后续 rebind 权限。
 
 所有读取、更新、发送操作必须执行角色、成员状态和对象可见性校验。leave/remove 后不得继续读取成员专属状态或发送消息。
 
@@ -249,7 +254,7 @@ DID discovery 必须限制 scheme、host、port、重定向和地址类别，防
 
 `anp.get_capabilities` 必须与真实实现一致：
 
-- `anp.group.base.v1` 在 supported profiles 中；
+- `anp.group.base.v1` 和 `anp.group.base.v2` 在实际支持的方法 profile 中；`group.rebind_member` 仅属于 v1；
 - `features.group_participant.enabled=true`；
 - `features.group_participant.management=true`；
 - join modes 仅为 `open-join` 和 `admin-add`；
@@ -258,6 +263,11 @@ DID discovery 必须限制 scheme、host、port、重定向和地址类别，防
 - Direct/Group E2EE、large-group fanout、Group HA 和 federation relay 明确禁用。
 
 不能将 relay、HA、E2EE 或大群能力包装成“完整 federation”或“完整群管理”。
+
+本地 `/im/rpc` 声明 `awiki.message-sync.explicit-negotiation.v1` 与 `sync.snapshot_paging.v1`，
+并实现对应 ordinary 同步与 Schema 3 Snapshot。公开 peer 入口不声明本域同步模式。P5/P6 保持
+未实现并在请求时明确拒绝。普通 WS 可协商 `awiki.sync.event.v3`，发送 schema 2 dirty hint；
+每次连接和连接存续期间都验证当前设备 token 与安装绑定。
 
 ## 10. 测试门禁
 

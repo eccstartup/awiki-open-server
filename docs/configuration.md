@@ -91,3 +91,9 @@ Uploaded local DID Documents must belong to `AWIKI_DID_DOMAIN`, use the current 
 ## 9. Tokens
 
 Access tokens last one hour; refresh tokens last 30 days and rotate on refresh; stale/expired refresh tokens are rejected; and revocation invalidates tokens, DID verification, WebSocket tickets, and profile access. Never put tokens in screenshots, issues, ordinary logs, or client examples.
+
+Manifest-backed single-device authentication uses a persistent exact-device binding and signed JWTs; see
+[the single-device authentication contract](single-device-auth.zh-CN.md). If no Service key is configured,
+the server atomically creates a mode-0600 `AWIKI_DATA_DIR/auth-token-key.pem` and reuses it after restart.
+Include that file in consistent backups and restores. When using the configured Service key, retain the
+existing protected Service-key backup procedure.

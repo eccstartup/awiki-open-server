@@ -7,7 +7,8 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from tests.helpers import did_keypair_document, sign_did_document
+from tests.helpers import bound_did_keypair_document, sign_did_document
+from tests.test_group_v2 import group_call
 
 
 RUN_PUBLIC_SYSTEM_TESTS = os.environ.get("AWIKI_RUN_PUBLIC_SYSTEM_TESTS", "").lower() in {"1", "true", "yes"}
@@ -23,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest_asyncio.fixture
 async def public_client():
-    async with httpx.AsyncClient(base_url=PUBLIC_BASE_URL, timeout=20.0) as client:
+    async with httpx.AsyncClient(base_url=PUBLIC_BASE_URL, timeout=20.0, trust_env=False) as client:
         yield client
 
 
@@ -64,7 +65,7 @@ async def test_rwiki_cn_public_service_surface(public_client):
     assert service["serviceDid"] == PUBLIC_SERVICE_DID
     assert service["authSchemes"] == ["bearer", "didwba"]
     assert "anp.direct.base.v1" in service["profiles"]
-    assert "anp.group.base.v1" in service["profiles"]
+    assert "anp.group.base.v2" in service["profiles"]
     assert "anp.attachment.v1" in service["profiles"]
     assert document.get("verificationMethod")
     assert document.get("authentication")
@@ -110,20 +111,21 @@ async def test_rwiki_cn_mvp_identity_direct_and_disabled_contact_verification(pu
     bob_handle = f"sysbob{suffix}"
     alice_did = f"did:wba:{PUBLIC_DID_DOMAIN}:{alice_handle}:e1_{suffix}"
     bob_did = f"did:wba:{PUBLIC_DID_DOMAIN}:{bob_handle}:e1_{suffix}"
-    alice_key, alice_doc = did_keypair_document(alice_did)
-    bob_key, bob_doc = did_keypair_document(bob_did)
+    alice_key, alice_doc = bound_did_keypair_document(alice_did)
+    alice_did = alice_doc["id"]
+    bob_key, bob_doc = bound_did_keypair_document(bob_did)
+    bob_did = bob_doc["id"]
     for did_document in (alice_doc, bob_doc):
         did_document["service"][0]["serviceEndpoint"] = f"{PUBLIC_BASE_URL}/anp-im/rpc"
         did_document["service"][0]["serviceDid"] = PUBLIC_SERVICE_DID
         did_document["service"][0]["authSchemes"] = ["bearer", "didwba"]
         did_document["service"][0]["profiles"] = [
             "anp.direct.base.v1",
-            "anp.group.base.v1",
+            "anp.group.base.v2",
             "anp.attachment.v1",
         ]
     alice_doc = sign_did_document(alice_doc, alice_key)
     bob_doc = sign_did_document(bob_doc, bob_key)
-    del alice_key, bob_key
 
     alice_reg = await rpc(
         public_client,
@@ -151,7 +153,7 @@ async def test_rwiki_cn_mvp_identity_direct_and_disabled_contact_verification(pu
         assert services[0]["authSchemes"] == ["bearer", "didwba"]
         assert "anp.direct.base.v1" in services[0]["profiles"]
 
-    resolved = await public_client.get(f"/{alice_handle}/e1_{suffix}/did.json")
+    resolved = await public_client.get("/" + alice_did.split(":", 3)[3].replace(":", "/") + "/did.json")
     assert resolved.status_code == 200
     assert resolved.json()["id"] == alice_did
 
@@ -186,9 +188,14 @@ async def test_rwiki_cn_mvp_identity_direct_and_disabled_contact_verification(pu
     )
     assert history["result"]["messages"][0]["message_id"] == sent["result"]["message_id"]
 
-    group_did = f"did:wba:{PUBLIC_DID_DOMAIN}:groups:open"
-    joined = await rpc(public_client, "/im/rpc", "group.join", {"group_did": group_did}, token=alice_reg["result"]["token"])
-    assert joined["result"]["joined"] is True
+    alice = (alice_did, alice_reg["result"]["token"], alice_key, alice_doc)
+    bob = (bob_did, bob_reg["result"]["token"], bob_key, bob_doc)
+    created = await group_call(public_client, alice, "group.create", PUBLIC_SERVICE_DID,
+                               "public-create-" + suffix, {})
+    group_did = created["result"]["group_did"]
+    joined = await group_call(public_client, bob, "group.join", group_did,
+                              "public-join-" + suffix, {})
+    assert joined["result"]["membership_status"] == "active"
 
     group_create = await rpc(public_client, "/im/rpc", "group.create", {"display_name": "nope"}, token=alice_reg["result"]["token"])
     assert group_create["error"]["message"] == "missing_origin_proof"

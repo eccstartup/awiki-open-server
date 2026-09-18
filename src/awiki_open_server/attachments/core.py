@@ -105,6 +105,7 @@ def _slot_expiry() -> str:
 
 def attachment_create_slot(params: dict[str, Any], request: Request) -> dict[str, Any]:
     owner = current_did(request)
+    canonical = isinstance(params.get("_anp_body"), dict)
     encryption_info = params.get("encryption_info") if isinstance(params.get("encryption_info"), dict) else {}
     object_encryption_mode = params.get("object_encryption_mode") or encryption_info.get("mode", "none")
     intended_security = params.get("intended_message_security_profile", "transport-protected")
@@ -165,6 +166,19 @@ def attachment_create_slot(params: dict[str, Any], request: Request) -> dict[str
         "object_uri": object_uri,
         "expires_at": expires_at,
     }
+    if canonical:
+        return {
+            key: result[key]
+            for key in (
+                "attachment_id",
+                "slot_id",
+                "upload_uri",
+                "upload_headers",
+                "object_uri",
+                "commit_token",
+                "expires_at",
+            )
+        }
     if expected_size is not None:
         result["expected_size"] = expected_size
     if expected_sha256 is not None:
@@ -257,7 +271,7 @@ def attachment_commit(params: dict[str, Any], request: Request) -> dict[str, Any
         )
         conn.execute("UPDATE attachment_slots SET status = ? WHERE slot_id = ?", ("committed", slot_id))
     committed_at = now_iso()
-    return {
+    result = {
         "committed": True,
         "attachment_id": attachment_id,
         "slot_id": slot_id,
@@ -273,10 +287,17 @@ def attachment_commit(params: dict[str, Any], request: Request) -> dict[str, Any
         },
         "content_type": content_type,
     }
+    if canonical:
+        return {
+            key: result[key]
+            for key in ("committed", "attachment_id", "object_uri", "committed_at")
+        }
+    return result
 
 
 def attachment_abort(params: dict[str, Any], request: Request) -> dict[str, Any]:
     owner = current_did(request)
+    canonical = isinstance(params.get("_anp_body"), dict)
     slot_id = params.get("slot_id")
     if not slot_id:
         raise InvalidParams("slot_id_required")
@@ -288,7 +309,15 @@ def attachment_abort(params: dict[str, Any], request: Request) -> dict[str, Any]
         if path.exists():
             path.unlink()
         conn.execute("UPDATE attachment_slots SET status = ? WHERE slot_id = ?", ("aborted", slot_id))
-    return {"aborted": True, "attachment_id": params.get("attachment_id"), "slot_id": slot_id, "aborted_at": now_iso()}
+    result = {
+        "aborted": True,
+        "attachment_id": params.get("attachment_id"),
+        "slot_id": slot_id,
+        "aborted_at": now_iso(),
+    }
+    if canonical:
+        result.pop("slot_id")
+    return result
 
 
 def cleanup_expired_attachments(store: Any, *, now: str | None = None) -> dict[str, int]:
@@ -551,7 +580,12 @@ def attachment_ticket(params: dict[str, Any], request: Request) -> dict[str, Any
         "object_uri": _ticket_object_uri(settings, str(row["object_id"]), row["object_uri"]),
         "requester_did": requester,
     }
-    return {
+    response_binding = (
+        {key: value for key, value in params["_anp_body"].items() if key != "one_time"}
+        if anp_ticket and isinstance(params.get("_anp_body"), dict)
+        else ticket_binding
+    )
+    result = {
         "ticket": ticket,
         "download_ticket_b64u": ticket,
         "object_id": object_id,
@@ -559,9 +593,15 @@ def attachment_ticket(params: dict[str, Any], request: Request) -> dict[str, Any
         "download_url": download_uri,
         "download_uri": download_uri,
         "download_headers": {"Authorization": f"Bearer {ticket}"},
-        "ticket_binding": ticket_binding,
+        "ticket_binding": response_binding,
         "expires_at": expires_at,
     }
+    if anp_ticket:
+        return {
+            key: result[key]
+            for key in ("download_ticket_b64u", "expires_at", "ticket_binding")
+        }
+    return result
 
 
 ATTACHMENT_HANDLERS = {

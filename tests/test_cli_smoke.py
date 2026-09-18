@@ -9,6 +9,18 @@ from scripts import awiki_open_cli
 from scripts.awiki_open_cli import anp_params, smoke_awiki_info, verify_public
 
 
+def test_rust_cli_failure_diagnostics_redact_credentials_before_logging():
+    result = awiki_open_cli._safe_cli_diagnostic(
+        ("id", "register", "--phone", "13912345678", "--otp", "654321"),
+        json.dumps({"ok": False, "error": {"code": "auth_failed", "message": "invalid 654321 for 13912345678"}, "access_token": "fixture-secret", "private_key_pem": "fixture-key"}),
+    )
+    rendered = json.dumps(result)
+    for secret in ("13912345678", "654321", "fixture-secret", "fixture-key"):
+        assert secret not in rendered
+    assert result["response"]["error"]["code"] == "auth_failed"
+    assert "unstructured-secret" not in json.dumps(awiki_open_cli._safe_cli_diagnostic((), "unstructured-secret"))
+
+
 def test_cli_help():
     result = subprocess.run(
         [sys.executable, "scripts/awiki_open_cli.py", "--help"],

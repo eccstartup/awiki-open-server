@@ -127,3 +127,8 @@ did:wba:<domain>:users:<handle>:e1_default
 - revoke 后 token、DID verify、WebSocket ticket 和 profile access 失效。
 
 Token 不得写入截图、Issue、普通日志或客户端示例。
+
+带 Manifest 的唯一设备认证使用持久绑定和签名 JWT，具体 claims、续期与拒绝规则见
+[单设备身份认证](single-device-auth.zh-CN.md)。没有配置 Service key 时，服务在
+`AWIKI_DATA_DIR/auth-token-key.pem` 原子创建 0600 权限的本地 token 签名键并在重启后复用；
+备份/恢复需同时保留该文件。配置了 Service key 时，按现有更严格的服务密钥备份规则保留它。

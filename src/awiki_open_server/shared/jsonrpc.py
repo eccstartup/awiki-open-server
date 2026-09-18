@@ -17,6 +17,7 @@ from awiki_open_server.shared.errors import (
     MethodNotFound,
     NotFound,
     NotSupported,
+    SyncProtocolError,
     Unauthorized,
 )
 
@@ -295,6 +296,19 @@ def _strict_envelope(
 
 def _strict_business_error(exc: AwikiError, request_id: str | None) -> dict[str, Any]:
     details = dict(exc.data)
+    if isinstance(exc, SyncProtocolError):
+        return anp_error(
+            exc.code,
+            exc.anp_code,
+            request_id,
+            message=exc.error_message,
+            retryable=exc.retryable,
+            details=details.get("details") if isinstance(details.get("details"), dict) else details,
+        )
+    group_codes = {"group.not_member": 3000, "group.already_member": 3001, "group.policy_violation": 3003,
+                   "group.invalid_group_receipt": 3010}
+    if exc.error_message in group_codes:
+        return anp_error(group_codes[exc.error_message], exc.error_message, request_id, message=exc.error_message, details=details)
     if isinstance(exc, Unauthorized):
         return anp_error(1005, "anp.unauthorized", request_id, message=exc.error_message, details=details)
     if isinstance(exc, Conflict):
@@ -387,11 +401,13 @@ async def dispatch(
     except AwikiError as exc:
         if is_notification:
             _LOGGER.warning("ANP notification rejected method=%s reason=%s", method, exc.error_message)
+            request.state.notification_error_status = 401 if isinstance(exc, Unauthorized) else 400
             return None
         return _strict_business_error(exc, request_id)
     except Exception:
         _LOGGER.exception("ANP handler failed method=%s", method)
         if is_notification:
+            request.state.notification_error_status = 500
             return None
         return standard_error(-32603, "Internal error", request_id)
 

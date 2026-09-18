@@ -2,13 +2,21 @@
 
 [English](client-compatibility.md) | [简体中文](client-compatibility.zh-CN.md)
 
-最后整理日期：2026-08-08。兼容性应以具体客户端 version/commit、服务端 commit 和验证日期记录。
+最后整理日期：2026-09-18。以下区分未发布候选证据与历史正式客户端证据。
 
-## 1. 总览
+## 当前协议升级路径（R3）
+
+验收客户端是 `https://awiki.info/cli/stable/manifest.json` 的未修改正式 CLI：**1.0.52**，commit `dde0a9c54eebf29a2ec97089e90a1fa77ba768c5`，linux-amd64 SHA-256 `a055da8dad2969739c50cee4f2ee0bf34b45f5354ea74617f103534b239f9d1a`。不要把 candidate16、`--community` 或未发布的 1.0.53 Community 构建当作当前路径。
+
+新身份使用正式 `id register`，需要 Handle 和手机验证材料。Open Server 不发送短信；`send_otp`（purpose `awiki.identity.register.v1`）把一次性本地操作码写到数据目录，再用 `--otp` 完成注册。可靠 listener 需要真实单设备 Manifest/绑定。正式 CLI 1.0.52 会请求 P5/P6，Open Server 返回 `sync.lanes_not_supported`，不实现 E2EE。该设备的普通 Schema 3 Snapshot 恢复已实现。Open 不提供身份/Handle 找回或 Root Transfer。
+
+R2 未发布 CLI 1.0.53 / SHA `8169383d86a57eaed23e015dc948f8176216e9f81903d16f590dd03c513f847f`（基于 `c61fa4b419b96fdabdbd321f1a8e47cdd7f77302`）只作历史记录。
+
+## 1. 历史证据与客户端定位
 
 | 客户端/对端 | 当前定位 | 已知能力 | 关键限制 |
 | --- | --- | --- | --- |
-| `awiki-cli` | 主要兼容验证客户端 | 1.0.43 `bbeb8a5c` 已验证本地 Attachment/members/mark-read/restart、Realtime Sync v2，以及双向 Direct/Group 跨域 Gate | Sync v2 仅单设备拉取；无设备共享、第二设备、snapshot recovery 或 E2EE |
+| `awiki-cli` | 主要兼容验证客户端 | 1.0.43 `bbeb8a5c` 已验证本地 Attachment/members/mark-read/restart、Realtime Sync v2，以及双向 Direct/Group 跨域 Gate | Sync v2 仅单设备拉取；无设备共享、第二设备或 E2EE。该设备的普通 Schema 3 Snapshot 恢复已实现 |
 | AWiki Me | 基础产品兼容目标 | 自定义租户下的身份/消息/附件需持续验证 | Agent realm allowlist；无 E2EE；不能宣称所有 App 功能兼容 |
 | 其他 ANP Peer | 选定 public methods | capability、Direct、部分 Group/Attachment | 不是完整 federation；需要 origin proof 与 service signature |
 | 旧 AWiki Client | compatibility routes | User/Message Service 风格路由 | shim 不等于生产身份提供方或完整托管平台 |
@@ -29,26 +37,29 @@
 分页、幂等 mark-read 与重启持久化、`awiki.sync.changed.v2` foreground Realtime、listener/server
 重启恢复，以及两个独立 TLS 域的双向明文 Direct 和两个 Group Host 方向均通过。这里的 v2 是 wire
 contract 版本，不是多设备能力声明：Open Server 将一个 DID 固定到恰好一个设备和一个 client
-instance，只支持 tail-only bootstrap、delta、`message.get_batch` 与 thread catch-up；第二设备或
-第二 client instance 返回 `not_supported`，也不发布 snapshot recovery 或设备间状态共享。
+instance；第二设备或第二 client instance 返回 `not_supported`。空账号可以 tail-only
+bootstrap；日志缺口和过期 cursor 走 Schema 3 分页 Snapshot
+（`awiki.message-sync.explicit-negotiation.v1`、`sync.snapshot_paging.v1`），再接普通
+delta。正式 CLI 1.0.52 仍会请求 P5/P6，Open Server 明确返回 `sync.lanes_not_supported`，不静默空集、不实现
+E2EE。不提供设备间状态共享。
 
 可重复的分层验证：
 
 ```bash
 # 连接 Gate：配置、注册并执行明文 Direct 写入
-PYTHONPATH=../anp/anp:src python3 scripts/awiki_open_cli.py smoke-rust-cli-connect \
+uv run --locked python scripts/awiki_open_cli.py smoke-rust-cli-connect \
   --awiki-cli-bin /path/to/pinned/awiki-cli --clean
 
 # 完整本地 Gate；Attachment 的标准 DID 发现需要 HTTPS，脚本会创建隔离网络命名空间和测试 CA
-PYTHONPATH=../anp/anp:src python3 scripts/awiki_open_cli.py smoke-rust-cli-local \
+uv run --locked python scripts/awiki_open_cli.py smoke-rust-cli-local \
   --awiki-cli-bin /path/to/pinned/awiki-cli --standard-https --clean
 
 # foreground Realtime/Sync v2，以及 listener 与 OpenServer 重启恢复
-PYTHONPATH=../anp/anp:src python3 scripts/awiki_open_cli.py smoke-rust-cli-realtime-restart \
+uv run --locked python scripts/awiki_open_cli.py smoke-rust-cli-realtime-restart \
   --awiki-cli-bin /path/to/pinned/awiki-cli --clean
 
 # 两个 TLS OpenServer 域：双向明文 Direct 与两个 Group Host 方向
-PYTHONPATH=../anp/anp:src python3 scripts/awiki_open_cli.py smoke-rust-cli-cross-domain \
+uv run --locked python scripts/awiki_open_cli.py smoke-rust-cli-cross-domain \
   --awiki-cli-bin /path/to/pinned/awiki-cli --clean
 ```
 
@@ -56,20 +67,22 @@ PYTHONPATH=../anp/anp:src python3 scripts/awiki_open_cli.py smoke-rust-cli-cross
 
 ```bash
 AWIKI_RUN_RUST_CLI_SYSTEM_TESTS=1 AWIKI_CLI_BIN=/path/to/pinned/awiki-cli \
-PYTHONPATH=../anp/anp:src python3 -m pytest tests/test_rust_cli_system.py -q
+uv run --locked python -m pytest tests/test_rust_cli_system.py -q
 ```
 
 报告必须区分 `connection-and-write passed`、`single-device sync v2 passed` 和
 `full local user journey passed`，并保存 CLI commit、`awiki-cli version`、artifact SHA-256、
 Open Server commit 与日期。
 
-连接示例：
+候选连接示例（先按 [CLI 身份密钥存储说明](https://github.com/AgentConnect/awiki-cli-rs2/blob/c61fa4b419b96fdabdbd321f1a8e47cdd7f77302/docs/architecture/identity-secret-storage.md) 配置密钥存储）：
 
 ```bash
-awiki-cli tenant setup community \
-  --backend-base-url https://community.example.com \
-  --did-host community.example.com
-awiki-cli init
+awiki-cli tenant create open \
+  --backend-base-url https://open.example.com \
+  --did-host open.example.com
+awiki-cli tenant use open
+awiki-cli id register --handle alice --phone +15550000001
+awiki-cli id register --handle alice --phone +15550000001 --otp <local-operator-code>
 ```
 
 安全限制：
@@ -174,3 +187,5 @@ ANP SDK version：
 - large-group/complex governance
 - ...
 ```
+
+自定义租户不会自动发现其他租户的旧凭据。显式导入旧身份时使用 `awiki-cli --migration id import-v1 --name <name> --credentials-dir <旧凭据目录>`；此参数仅指定本次导入来源，不更改租户配置，也不启动可靠 listener。

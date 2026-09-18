@@ -333,6 +333,7 @@ def validate_origin_proof_structure(
     meta: dict[str, Any],
     body: dict[str, Any],
     sender_did_document: dict[str, Any] | None = None,
+    verified_at: datetime | None = None,
 ) -> None:
     require_origin_proof(auth)
     proof = auth["origin_proof"]
@@ -347,6 +348,7 @@ def validate_origin_proof_structure(
             body=body,
             did_document=sender_did_document,
             expected_signer_did=sender_did,
+            verified_at=verified_at,
         )
     except AnpProtocolError as exc:
         raise Unauthorized(exc.code, data={"detail": exc.detail}) from exc
