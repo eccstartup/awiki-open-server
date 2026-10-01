@@ -590,17 +590,48 @@ def mount_routes(app: FastAPI) -> None:
     async def resolve_did_path(sub_path: str, request: Request):
         settings = request.app.state.settings
         did_path = sub_path.strip("/")
-        did = f"did:wba:{settings.did_domain}"
-        if did_path:
-            did = f"{did}:{did_path.replace('/', ':')}"
+        suffix = f":{did_path.replace('/', ':')}" if did_path else ""
+        # 端口是注册方那一侧的输入（`did register --target http://host:8765/...` 把 8765
+        # 拼进 host 段），本机未必把它写进了自己的声明。§2.1 里 `host%3Aport` 与裸域是两条
+        # DID，但都是"本机域下的同一条路径"——归属判断不看端口，所以这几种拼法都查，不跨域：
+        # 本机声明的那个、请求实际到达的那个、以及裸域。
+        request_port = request.url.port
+        authorities = [settings.did_authority, settings.did_domain]
+        if request_port is not None and request_port not in (80, 443):
+            authorities.insert(0, f"{settings.did_domain}%3A{request_port}")
+        candidates = [
+            f"did:wba:{authority}{suffix}" for authority in dict.fromkeys(authorities)
+        ]
         with get_store(request).connect() as conn:
-            row = conn.execute(
-                """
-                SELECT document_json FROM did_documents
-                WHERE did = ? AND COALESCE(status, 'active') = 'active' AND revoked_at IS NULL
-                """,
-                (did,),
-            ).fetchone()
+            row = None
+            for candidate in candidates:
+                row = conn.execute(
+                    """
+                    SELECT document_json FROM did_documents
+                    WHERE did = ? AND COALESCE(status, 'active') = 'active' AND revoked_at IS NULL
+                    """,
+                    (candidate,),
+                ).fetchone()
+                if row is not None:
+                    break
+            if row is None and did_path:
+                # 稳定主体路径（ANP-03 §2.2.3）：不带绑定指纹段时，按前缀取该主体当前的
+                # 那条 DID。这里只回答"当前是哪条"，不据此判定两个 DID 同属一个主体——
+                # 那是解析方按 successorDid 链验的事（§2.5）。
+                for candidate in candidates:
+                    prefix = f"{candidate}:"
+                    row = conn.execute(
+                        """
+                        SELECT document_json FROM did_documents
+                        WHERE substr(did, 1, length(?)) = ?
+                          AND COALESCE(status, 'active') = 'active' AND revoked_at IS NULL
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
+                        (prefix, prefix),
+                    ).fetchone()
+                    if row is not None:
+                        break
         if not row:
             raise HTTPException(status_code=404, detail="did_document_not_found")
         return json.loads(row["document_json"])

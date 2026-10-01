@@ -7,9 +7,11 @@ import json
 import os
 import re
 import secrets
+import urllib.parse
 from typing import Any
 from urllib.parse import unquote
 
+from cryptography.exceptions import InvalidSignature
 from fastapi import Request
 import jcs
 
@@ -17,6 +19,7 @@ from awiki_open_server.app.settings import Settings
 from awiki_open_server.protocol.anp_adapter import (
     AnpProtocolError,
     SingleDeviceManifest,
+    find_verification_method,
     require_did_document_binding,
     signature_keyid,
     validate_single_device_document,
@@ -26,7 +29,12 @@ from awiki_open_server.protocol.anp_adapter import (
     verify_web_handle_documents,
 )
 from awiki_open_server.protocol.registry import STANDARD_PROFILES
-from awiki_open_server.service_identity import verify_did_document_data_integrity_proof
+from awiki_open_server.service_identity import (
+    _b64u_decode,
+    _ed25519_public_key_from_multikey,
+    verify_did_document_data_integrity_proof,
+    verify_handle_ad_proof,
+)
 from awiki_open_server.shared.errors import (
     Conflict,
     InvalidParams,
@@ -100,10 +108,16 @@ def _did_parts(did: str) -> list[str]:
 
 
 def _did_domain(did: str) -> str | None:
+    """DID 的**域**：host 段去掉端口之后的那一半。
+
+    端口在 host 段里按 ANP-03 §2.1 写成 `%3Aport`（`did:wba:localhost%3A8765:user:alice:e1_x`），
+    它不属于域。归属判断（这条 DID 是不是本机托管的）比的是域，所以在这里剥掉端口；
+    要拼回 DID 的时候用 `settings.did_authority`，那一侧保留端口。
+    """
     parts = _did_parts(did)
     if len(parts) < 3 or parts[0] != "did" or parts[1] != "wba":
         return None
-    return parts[2].lower()
+    return urllib.parse.unquote(parts[2]).split(":", 1)[0].lower()
 
 
 def _is_e1_did(did: str) -> bool:
@@ -111,7 +125,7 @@ def _is_e1_did(did: str) -> bool:
 
 
 def _default_user_did(settings: Settings, local_handle: str) -> str:
-    return f"did:wba:{settings.did_domain}:users:{local_handle}:e1_default"
+    return f"did:wba:{settings.did_authority}:users:{local_handle}:e1_default"
 
 
 def _validate_local_user_did(did: str, settings: Settings) -> str:
@@ -293,9 +307,14 @@ def did_document(settings: Settings, did: str, handle: str | None = None) -> dic
     }
 
 
-def _ensure_anp_message_service(document: dict[str, Any], settings: Settings, did: str) -> dict[str, Any]:
+def _ensure_anp_message_service(
+    document: dict[str, Any],
+    settings: Settings,
+    did: str,
+    verify_proof: bool = True,
+) -> dict[str, Any]:
     doc = dict(document)
-    if isinstance(doc.get("proof"), dict):
+    if isinstance(doc.get("proof"), dict) and verify_proof:
         if doc.get("id") != did:
             raise InvalidParams("did_document_id_mismatch", data={"did": did, "document_id": doc.get("id")})
         proof = doc["proof"]
@@ -519,12 +538,86 @@ def _consume_registration_otp(conn, *, phone: str, otp: str, handle: str | None)
     )
 
 
+# ---------------------------------------------------------------------------
+# One-time challenge for DID proof-of-possession during registration
+#
+# `register` verifies the DID document's self-signed proof (integrity) AND a
+# fresh challenge signature. The challenge is a server-issued random nonce that
+# the client signs with its Ed25519 key; the server verifies that against the
+# key embedded in the submitted document. This binds "the person submitting
+# now" to "the key's owner" — a self-signed document alone is replayable, since
+# anyone can re-POST a copy of it. The challenge is short-TTL and single-use.
+# ---------------------------------------------------------------------------
+
+CHALLENGE_TTL = timedelta(seconds=300)
+_active_challenges: dict[str, dict[str, Any]] = {}
+
+
+def challenge(params: dict[str, Any], request: Request) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    _prune_challenges(now)
+    value = secrets.token_hex(16)
+    expires_at = now + CHALLENGE_TTL
+    _active_challenges[value] = {"created_at": now, "expires_at": expires_at, "handle": params.get("handle")}
+    return {
+        "challenge": value,
+        "created_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "expires_in": int(CHALLENGE_TTL.total_seconds()),
+    }
+
+
+def _prune_challenges(now: datetime) -> None:
+    for key, entry in list(_active_challenges.items()):
+        if entry["expires_at"] <= now:
+            _active_challenges.pop(key, None)
+
+
+def verify_challenge_signature(document: dict[str, Any], challenge: str, signature_b64u: str) -> None:
+    if not isinstance(challenge, str) or not challenge:
+        raise InvalidParams("challenge_required")
+    entry = _active_challenges.pop(challenge, None)
+    if entry is None:
+        raise InvalidParams("challenge_expired")
+    if _is_past(entry["expires_at"].isoformat()):
+        raise InvalidParams("challenge_expired")
+    proof = document.get("proof") if isinstance(document.get("proof"), dict) else {}
+    vm_id = proof.get("verificationMethod") or f"{document['id']}#key-1"
+    method = find_verification_method(document, vm_id)
+    if method is None:
+        raise InvalidParams("challenge_verification_method_missing")
+    multikey = method.get("publicKeyMultibase")
+    public_key = _ed25519_public_key_from_multikey(multikey)
+    try:
+        public_key.verify(_b64u_decode(signature_b64u), challenge.encode("utf-8"))
+    except (InvalidSignature, ValueError) as exc:
+        raise InvalidParams("challenge_signature_invalid") from exc
+
+
 def register(params: dict[str, Any], request: Request) -> dict[str, Any]:
     settings = get_settings(request)
     raw_handle = params.get("handle") or f"user-{new_id('h')[2:8]}"
     local_handle = str(raw_handle).split("@", 1)[0].split(".", 1)[0]
     full_handle = str(raw_handle) if ("@" in str(raw_handle) or "." in str(raw_handle)) else f"{local_handle}.{settings.did_domain}"
     stored_handle = str(raw_handle) if "@" in str(raw_handle) else f"{local_handle}@{settings.did_domain}"
+    # Aggregate model: one handle = ONE ad.json listing every DID under it. The
+    # extension submits the aggregate via `ad`; we bind the handle to ALL its
+    # DIDs (upsert), instead of registering each key as a separate handle.
+    ad = params.get("ad") if isinstance(params.get("ad"), dict) else None
+    if ad is None:
+        maybe_doc = params.get("did_document")
+        if isinstance(maybe_doc, dict) and isinstance(maybe_doc.get("dids"), list):
+            ad = maybe_doc
+    if ad is not None:
+        return _register_aggregate(
+            params,
+            settings,
+            ad,
+            local_handle,
+            full_handle,
+            stored_handle,
+            request,
+        )
     uploaded_doc = params.get("did_document") if isinstance(params.get("did_document"), dict) else None
     if uploaded_doc and not isinstance(uploaded_doc.get("proof"), dict) and not settings.allow_unsigned_peer_dev:
         raise InvalidParams("unsigned_did_document_requires_dev_mode")
@@ -540,6 +633,19 @@ def register(params: dict[str, Any], request: Request) -> dict[str, Any]:
     doc = _ensure_anp_message_service(uploaded_doc or did_document(settings, did, stored_handle), settings, did)
     doc["id"] = did
     manifest = _validate_single_device_manifest(doc)
+    challenge_value = params.get("challenge")
+    challenge_sig = params.get("challenge_signature")
+    # A challenge signature is an OPTIONAL proof-of-possession binding. When the
+    # client provides both, verify it (and consume the single-use challenge);
+    # signed-doc flows that don't carry one still register via the integrity
+    # proof above. This keeps legacy/CLI signed-doc registration working.
+    if (
+        isinstance(challenge_value, str)
+        and challenge_value
+        and isinstance(challenge_sig, str)
+        and challenge_sig
+    ):
+        verify_challenge_signature(doc, challenge_value, challenge_sig)
     user_id = f"user-{hashlib.sha256(did.encode()).hexdigest()[:24]}"
     account = device_account(did, manifest) if manifest is not None else None
     if account is not None:
@@ -607,6 +713,223 @@ def register(params: dict[str, Any], request: Request) -> dict[str, Any]:
             "binding_generation": "1",
         }
     return result
+
+
+def _submitting_did_from_ad(ad: dict[str, Any]) -> str:
+    proof = ad.get("proof")
+    if isinstance(proof, dict):
+        vm = proof.get("verificationMethod")
+        if isinstance(vm, str) and "#" in vm:
+            did, frag = vm.split("#", 1)
+            if frag != "key-1":
+                raise InvalidParams("handle_ad_proof_verification_method_mismatch")
+            return did
+    # No proof (dev mode / unsigned): fall back to the doc's own id. In strict
+    # mode verify_handle_ad_proof below still rejects the missing proof.
+    fallback = ad.get("id") or ad.get("did") or ad.get("owner")
+    if isinstance(fallback, str) and fallback:
+        return fallback
+    raise InvalidParams("handle_ad_proof_verification_method_required")
+
+
+def _did_document_from_aggregate(
+    ad: dict[str, Any],
+    did: str,
+    settings: Settings,
+    stored_handle: str,
+) -> dict[str, Any]:
+    # Derive a DID-scoped document for one of the handle's keys. The aggregate
+    # ad.json carries every key's verification method; we slice out the ones
+    # owned by `did`. Served unsigned — the server is authoritative for the doc.
+    vms = [
+        vm
+        for vm in ad.get("verificationMethod", [])
+        if isinstance(vm, dict) and str(vm.get("id", "")).startswith(f"{did}#")
+    ]
+    key_ids = [str(vm["id"]) for vm in vms if isinstance(vm.get("id"), str)]
+    services = ad.get("service") if isinstance(ad.get("service"), list) else []
+    return {
+        "@context": [
+            "https://www.w3.org/ns/did/v1",
+            "https://w3id.org/security/data-integrity/v2",
+            "https://w3id.org/security/multikey/v1",
+        ],
+        "id": did,
+        "alsoKnownAs": [stored_handle] if stored_handle else [],
+        "verificationMethod": vms,
+        "authentication": key_ids,
+        "assertionMethod": key_ids,
+        "service": services,
+    }
+
+
+def _upsert_aggregate_did(
+    conn: Any,
+    did: str,
+    stored_handle: str,
+    display_name: str,
+    ad: dict[str, Any],
+    settings: Settings,
+    access_expires_at: str,
+    refresh_expires_at: str,
+) -> tuple[str, str]:
+    # Each DID gets its OWN token/refresh_token — `users.token` and
+    # `users.refresh_token` are UNIQUE, so sharing one across the aggregate's
+    # DIDs would violate the constraint.
+    token = new_id("tok")
+    refresh_token = new_id("rtok")
+    doc = _did_document_from_aggregate(ad, did, settings, stored_handle)
+    now = now_iso()
+    conn.execute(
+        """
+        INSERT INTO users(did, handle, token, refresh_token, access_expires_at, refresh_expires_at, created_at, revoked_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+        ON CONFLICT(did) DO UPDATE SET
+          handle = excluded.handle,
+          token = excluded.token,
+          refresh_token = excluded.refresh_token,
+          access_expires_at = excluded.access_expires_at,
+          refresh_expires_at = excluded.refresh_expires_at,
+          revoked_at = NULL
+        """,
+        (did, stored_handle, token, refresh_token, access_expires_at, refresh_expires_at, now),
+    )
+    conn.execute(
+        """
+        INSERT INTO profiles(did, handle, display_name, avatar_uri, profile_uri, description, subject_type, profile_md)
+        VALUES (?, ?, ?, NULL, NULL, NULL, 'human', NULL)
+        ON CONFLICT(did) DO UPDATE SET handle = excluded.handle
+        """,
+        (did, stored_handle, display_name),
+    )
+    conn.execute(
+        """
+        INSERT INTO did_documents(did, document_json, updated_at, status, revoked_at)
+        VALUES (?, ?, ?, 'active', NULL)
+        ON CONFLICT(did) DO UPDATE SET
+          document_json = excluded.document_json,
+          updated_at = excluded.updated_at,
+          status = 'active',
+          revoked_at = NULL
+        """,
+        (did, _json(doc), now),
+    )
+    return token, refresh_token
+
+
+def _register_aggregate(
+    params: dict[str, Any],
+    settings: Settings,
+    ad: dict[str, Any],
+    local_handle: str,
+    full_handle: str,
+    stored_handle: str,
+    request: Request,
+) -> dict[str, Any]:
+    # One handle = one aggregate ad.json listing every DID under it. Registering
+    # a second key re-upserts the whole handle's DIDs rather than failing with
+    # `handle_already_registered`.
+    submitting_did = _submitting_did_from_ad(ad)
+    _validate_local_user_did(submitting_did, settings)
+    dids = [str(d) for d in ad.get("dids", []) if isinstance(d, str)]
+    if not dids:
+        raise InvalidParams("handle_ad_dids_required")
+    for d in dids:
+        _validate_local_user_did(d, settings)
+    if submitting_did not in dids:
+        raise InvalidParams("handle_ad_submitting_did_missing")
+
+    challenge_value = params.get("challenge")
+    challenge_sig = params.get("challenge_signature")
+    if not settings.allow_unsigned_peer_dev:
+        verify_handle_ad_proof(ad, submitting_did)
+    # Challenge signature is an OPTIONAL proof-of-possession binding — verify and
+    # consume it only when the client supplied both fields.
+    if (
+        isinstance(challenge_value, str)
+        and challenge_value
+        and isinstance(challenge_sig, str)
+        and challenge_sig
+    ):
+        verify_challenge_signature(ad, challenge_value, challenge_sig)
+
+    ad = _ensure_anp_message_service(ad, settings, submitting_did, verify_proof=False)
+    ad["id"] = submitting_did
+    ad["dids"] = dids
+
+    access_expires_at = _future_iso(ACCESS_TOKEN_TTL_SECONDS)
+    refresh_expires_at = _future_iso(REFRESH_TOKEN_TTL_SECONDS)
+    user_id = f"user-{hashlib.sha256(submitting_did.encode()).hexdigest()[:24]}"
+    display_name = str(params.get("display_name") or local_handle)
+    manifest = _validate_single_device_manifest(ad)
+    account = device_account(submitting_did, manifest) if manifest is not None else None
+
+    token: str | None = None
+    refresh_token: str | None = None
+    with get_store(request).connect() as conn:
+        existing = conn.execute(
+            "SELECT owner_did, dids_json, binding_generation FROM handle_documents WHERE handle = ?",
+            (stored_handle,),
+        ).fetchone()
+        if existing and existing["owner_did"] != submitting_did:
+            existing_dids = json.loads(existing["dids_json"] or "[]")
+            # Ownership can be transferred to a member DID already under this handle
+            # (the wallet "change primary" flow). A foreign DID is still rejected.
+            if submitting_did not in existing_dids:
+                raise Conflict("handle_already_registered", data={"handle": stored_handle, "did": existing["owner_did"]})
+        for d in dids:
+            d_token, d_refresh = _upsert_aggregate_did(
+                conn,
+                d,
+                stored_handle,
+                display_name,
+                ad,
+                settings,
+                access_expires_at,
+                refresh_expires_at,
+            )
+            if d == submitting_did:
+                token, refresh_token = d_token, d_refresh
+        conn.execute(
+            """
+            INSERT INTO handle_documents(handle, owner_did, ad_json, binding_generation, updated_at, dids_json)
+            VALUES (?, ?, ?, '1', ?, ?)
+            ON CONFLICT(handle) DO UPDATE SET
+              owner_did = excluded.owner_did,
+              ad_json = excluded.ad_json,
+              updated_at = excluded.updated_at,
+              dids_json = excluded.dids_json,
+              binding_generation = CASE WHEN handle_documents.owner_did <> excluded.owner_did
+                THEN CAST(CAST(handle_documents.binding_generation AS INTEGER) + 1 AS TEXT)
+                ELSE handle_documents.binding_generation END
+            """,
+            (stored_handle, submitting_did, _json(ad), now_iso(), _json(dids)),
+        )
+        if account is not None:
+            bind_device_account(conn, account, create=True)
+
+    assert token is not None and refresh_token is not None
+    if account is not None:
+        token = issue_device_token(account, request.app.state.auth_token_signing_key, ACCESS_TOKEN_TTL_SECONDS)
+        request.state.response_access_token = token
+
+    return {
+        "did": submitting_did,
+        "user_id": submitting_did,
+        "message": "Registration successful",
+        "handle": local_handle,
+        "domain": settings.did_domain,
+        "full_handle": full_handle,
+        "token": token,
+        "access_token": token,
+        "refresh_token": refresh_token,
+        "token_type": "Bearer",
+        "expires_in": ACCESS_TOKEN_TTL_SECONDS,
+        "expires_at": access_expires_at,
+        "refresh_expires_at": refresh_expires_at,
+        "document": ad,
+        "dids": dids,
+    }
 
 
 def verify(_: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -1242,6 +1565,16 @@ def handle_resolution_document(local_part: str, request: Request) -> dict[str, A
     settings = get_settings(request)
     _, _, stored_handle, _ = _split_handle(local_part, settings.did_domain)
     with get_store(request).connect() as conn:
+        hd = conn.execute(
+            "SELECT * FROM handle_documents WHERE handle = ?",
+            (stored_handle,),
+        ).fetchone()
+        if hd:
+            owner = conn.execute(
+                "SELECT p.* FROM profiles p WHERE p.did = ?",
+                (hd["owner_did"],),
+            ).fetchone()
+            return _handle_document_from_aggregate(dict(hd), dict(owner) if owner else {}, settings)
         row = conn.execute(
             """
             SELECT p.*,
@@ -1260,6 +1593,38 @@ def handle_resolution_document(local_part: str, request: Request) -> dict[str, A
     if not row:
         raise _user_service_not_found("handle", stored_handle.replace("@", ".", 1))
     return _handle_document_from_profile(dict(row), settings)
+
+
+def _handle_document_from_aggregate(
+    hd: dict[str, Any],
+    owner: dict[str, Any],
+    settings: Settings,
+) -> dict[str, Any]:
+    local, domain, _, full = _split_handle(str(hd["handle"]), settings.did_domain)
+    dids = _load(hd["dids_json"])
+    updated = str(hd["updated_at"] or now_iso())
+    display_name = owner.get("display_name") or local
+    return {
+        "handle": full,
+        "did": hd["owner_did"],
+        "dids": dids,
+        "status": "active",
+        "binding_generation": str(hd["binding_generation"] or "1"),
+        "updated": updated,
+        "profile": {
+            "type": "DIDSubjectProfile",
+            "subject_did": hd["owner_did"],
+            "subject_type": owner.get("subject_type") or "person",
+            "handle": full,
+            "display_name": display_name,
+            "description": owner.get("description"),
+            "avatar_uri": owner.get("avatar_uri"),
+            "profile_uri": owner.get("profile_uri") or f"https://{full}/",
+            "updated": updated,
+        },
+        "local_part": local,
+        "domain": domain,
+    }
 
 
 def handle_confirmation_document(did: str, request: Request) -> dict[str, Any]:
@@ -1892,6 +2257,7 @@ def send_otp(params: dict[str, Any], request: Request) -> dict[str, Any]:
 
 IDENTITY_HANDLERS = {
     "register": register,
+    "challenge": challenge,
     "update_document": update_document,
     "verify": verify,
     "verify_http_request": verify_http_request,

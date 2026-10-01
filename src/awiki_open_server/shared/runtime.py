@@ -29,11 +29,21 @@ def _load(raw: str) -> Any:
     return json.loads(raw)
 
 
-def _did_domain(did: str) -> str:
+def _did_authority(did: str) -> str:
+    """DID 的 host 段，**保留端口**：`did:wba:localhost%3A8765:user:alice:e1_x` → `localhost:8765`。
+
+    端口按 ANP-03 §2.1 编码在 host 段里，而取文档的 URL 是要带端口的，所以这一侧不能丢。
+    校验与解码交给 SDK 适配层，避免自己再实现一遍注入防护。
+    """
     try:
         return did_resolution_authority(did)
     except AnpProtocolError as exc:
         raise InvalidParams(exc.code) from exc
+
+
+def _did_domain(did: str) -> str:
+    """DID 的**域**：host 段去掉端口。归属判断比的是域，不是 host 段。"""
+    return _did_authority(did).split(":", 1)[0].lower()
 
 
 def _did_belongs_to_domain(did: str, domain: str) -> bool:
@@ -92,7 +102,7 @@ def _http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str] |
 
 
 def outbound_options(service: dict[str, Any], settings: Settings) -> dict[str, bool]:
-    authority = _did_domain(str(service.get("serviceDid", "")))
+    authority = _did_authority(str(service.get("serviceDid", "")))
     endpoint = urllib.parse.urlsplit(str(service.get("serviceEndpoint", "")))
     origin = (endpoint.scheme, endpoint.netloc.lower())
     override = (settings.did_resolver_base_urls or {}).get(authority)
@@ -126,9 +136,9 @@ def _anp_message_service(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def _fetch_did_document(did: str, settings: Settings) -> dict[str, Any]:
-    domain = _did_domain(did)
+    authority = _did_authority(did)
     resolver_map = settings.did_resolver_base_urls or {}
-    allow_private = domain in resolver_map
+    allow_private = authority in resolver_map
     url = _did_document_url(did, resolver_map)
     document = _http_get_json(url, allow_private=True) if allow_private else _http_get_json(url)
     if document.get("id") != did:

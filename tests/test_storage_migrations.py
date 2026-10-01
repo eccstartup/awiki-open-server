@@ -30,7 +30,11 @@ def test_protocol_alignment_migrations_are_additive_and_reentrant(tmp_path):
             (8, "identity-document-publication-revision"),
             (9, "remote-group-observation-boundaries"),
             (10, "standard-sync-negotiation-and-snapshot"),
+            (11, "handle-aggregate-ad-json"),
         ]
+        assert "handle_documents" in {
+            row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
         direct_columns = {row["name"] for row in conn.execute("PRAGMA table_info(direct_messages)")}
         assert {
             "meta_json",

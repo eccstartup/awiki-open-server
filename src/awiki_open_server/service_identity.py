@@ -77,6 +77,29 @@ def _ed25519_public_key_from_multikey(value: Any) -> ed25519.Ed25519PublicKey:
     return ed25519.Ed25519PublicKey.from_public_bytes(decoded[2:])
 
 
+def _encode_proof_value(signature: bytes) -> str:
+    """`proofValue` as base64url without padding.
+
+    The pinned ANP SDK (anp 1.0.3) verifies DID Document DataIntegrityProofs by
+    base64url-decoding `proofValue` (`anp.proof.proof.verify_w3c_proof`, reached
+    through `validate_did_document_binding`), so that is the encoding this server
+    must emit and accept. Multibase base58 (`z...`) belongs to the SDK's *object*
+    proofs — group receipts, DID-WBA bindings — a different proof family.
+    """
+    return _b64u(signature)
+
+
+def _decode_proof_value(value: Any, *, code: str = "did_document_proof_value_invalid") -> bytes:
+    """Base64url-decode a `proofValue` (with or without padding)."""
+    if not isinstance(value, str) or not value:
+        raise InvalidParams(code)
+    padding = "=" * (-len(value) % 4)
+    try:
+        return base64.b64decode((value + padding).encode("ascii"), altchars=b"-_", validate=True)
+    except (binascii.Error, UnicodeEncodeError, ValueError) as exc:
+        raise InvalidParams(code) from exc
+
+
 def _load_ed25519_private_key(pem: str) -> ed25519.Ed25519PrivateKey:
     key = load_pem_private_key(pem.encode(), password=None)
     if not isinstance(key, ed25519.Ed25519PrivateKey):
@@ -159,7 +182,7 @@ def _sign_did_document(document: dict[str, Any], key: ed25519.Ed25519PrivateKey,
     unsigned = {k: v for k, v in document.items() if k != "proof"}
     signing_input = _sha256(_canonical_json(proof)) + _sha256(_canonical_json(unsigned))
     signed = dict(document)
-    signed["proof"] = {**proof, "proofValue": _b64u(key.sign(signing_input))}
+    signed["proof"] = {**proof, "proofValue": _encode_proof_value(key.sign(signing_input))}
     return signed
 
 
@@ -203,7 +226,7 @@ def verify_did_document_data_integrity_proof(
     proof_value = proof.get("proofValue")
     if not isinstance(proof_value, str) or not proof_value:
         raise InvalidParams("did_document_proof_value_required")
-    signature = _b64u_decode(proof_value)
+    signature = _decode_proof_value(proof_value)
     if len(signature) != 64:
         raise InvalidParams("did_document_proof_value_invalid")
     proof_options = {k: v for k, v in proof.items() if k != "proofValue"}
@@ -213,6 +236,67 @@ def verify_did_document_data_integrity_proof(
         public_key.verify(signature, signing_input)
     except InvalidSignature as exc:
         raise InvalidParams("did_document_proof_invalid") from exc
+
+
+def verify_handle_ad_proof(ad: dict[str, Any], submitting_did: str) -> None:
+    """Verify a handle-level aggregate `ad.json` self-sign.
+
+    Unlike `verify_did_document_data_integrity_proof`, this document is NOT a
+    single DID document — it aggregates many distinct `e1_<fp>` DIDs under one
+    handle, so its verification methods carry different controllers. The proof is
+    signed by the *submitting* key (`<submitting_did>#key-1`), which must be one
+    of the DIDs listed in `ad.dids`. That key's possession is additionally proven
+    by the one-time challenge signature at the register layer.
+    """
+    did = ad.get("id")
+    if not isinstance(did, str) or not did:
+        raise InvalidParams("handle_ad_id_required")
+
+    proof = ad.get("proof")
+    if not isinstance(proof, dict):
+        raise InvalidParams("handle_ad_proof_required")
+    if proof.get("type") != "DataIntegrityProof":
+        raise InvalidParams("handle_ad_proof_type_not_supported")
+    if proof.get("cryptosuite") != "eddsa-jcs-2022":
+        raise InvalidParams("handle_ad_proof_cryptosuite_not_supported")
+    if proof.get("proofPurpose") != "assertionMethod":
+        raise InvalidParams("handle_ad_proof_purpose_not_supported")
+    if not isinstance(proof.get("created"), str) or not proof.get("created"):
+        raise InvalidParams("handle_ad_proof_created_required")
+
+    verification_method = proof.get("verificationMethod")
+    expected_vm = f"{submitting_did}#key-1"
+    if verification_method != expected_vm:
+        raise InvalidParams("handle_ad_proof_verification_method_mismatch")
+
+    dids = ad.get("dids", [])
+    if not isinstance(dids, list) or submitting_did not in dids:
+        raise InvalidParams("handle_ad_submitting_did_missing")
+
+    method = find_verification_method(ad, verification_method)
+    if method is None:
+        raise InvalidParams("handle_ad_proof_verification_method_missing")
+    if method.get("controller") not in (None, submitting_did):
+        raise InvalidParams("handle_ad_proof_verification_method_controller_mismatch")
+    if not is_verification_method_authorized(ad, verification_method, "assertionMethod"):
+        raise InvalidParams("handle_ad_proof_verification_method_unauthorized")
+    if method.get("type") != "Multikey":
+        raise InvalidParams("handle_ad_proof_public_key_not_supported")
+
+    public_key = _ed25519_public_key_from_multikey(method.get("publicKeyMultibase"))
+    proof_value = proof.get("proofValue")
+    if not isinstance(proof_value, str) or not proof_value:
+        raise InvalidParams("handle_ad_proof_value_required")
+    signature = _decode_proof_value(proof_value, code="handle_ad_proof_value_invalid")
+    if len(signature) != 64:
+        raise InvalidParams("handle_ad_proof_value_invalid")
+    proof_options = {k: v for k, v in proof.items() if k != "proofValue"}
+    unsigned = {k: v for k, v in ad.items() if k != "proof"}
+    signing_input = _sha256(_canonical_json(proof_options)) + _sha256(_canonical_json(unsigned))
+    try:
+        public_key.verify(signature, signing_input)
+    except InvalidSignature as exc:
+        raise InvalidParams("handle_ad_proof_invalid") from exc
 
 
 def build_service_did_document(service_did: str, endpoint: str, private_key_pem: str) -> dict[str, Any]:

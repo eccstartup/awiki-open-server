@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 CREATE TABLE IF NOT EXISTS users (
   did TEXT PRIMARY KEY,
-  handle TEXT UNIQUE NOT NULL,
+  handle TEXT NOT NULL,
   token TEXT UNIQUE NOT NULL,
   refresh_token TEXT UNIQUE,
   access_expires_at TEXT,
@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TEXT NOT NULL,
   revoked_at TEXT
 );
+
+CREATE INDEX IF NOT EXISTS users_handle_idx ON users(handle);
 
 CREATE TABLE IF NOT EXISTS profiles (
   did TEXT PRIMARY KEY REFERENCES users(did) ON DELETE CASCADE,
@@ -61,6 +63,18 @@ CREATE TABLE IF NOT EXISTS did_documents (
   updated_at TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active',
   revoked_at TEXT
+);
+
+-- One row per handle: the single aggregate `ad.json` listing every DID under it.
+-- `users.handle` is now non-unique (many DIDs per handle); this table is the
+-- authoritative source for handle → {owner_did, all dids} resolution.
+CREATE TABLE IF NOT EXISTS handle_documents (
+  handle TEXT PRIMARY KEY,          -- stored_handle, e.g. 'alice@localhost'
+  owner_did TEXT NOT NULL,          -- submitting/primary DID
+  ad_json TEXT NOT NULL,            -- the aggregate ad.json
+  binding_generation TEXT NOT NULL DEFAULT '1',
+  updated_at TEXT NOT NULL,
+  dids_json TEXT NOT NULL           -- JSON array of all DIDs under the handle
 );
 
 CREATE TABLE IF NOT EXISTS content_pages (
@@ -477,6 +491,7 @@ class Store:
     def init(self, did_domain: str = "localhost") -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self.relax_users_handle_unique(conn)
             self.ensure_column(conn, "direct_messages", "content_type", "TEXT NOT NULL DEFAULT 'text/plain'")
             self.ensure_column(conn, "direct_messages", "operation_id", "TEXT")
             self.ensure_column(conn, "direct_messages", "meta_json", "TEXT")
@@ -535,6 +550,7 @@ class Store:
                     (8, "identity-document-publication-revision"),
                     (9, "remote-group-observation-boundaries"),
                     (10, "standard-sync-negotiation-and-snapshot"),
+                    (11, "handle-aggregate-ad-json"),
                 ],
             )
             self.seed_groups(conn, did_domain)
@@ -572,6 +588,46 @@ class Store:
         if any(row["name"] == column for row in rows):
             return
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def relax_users_handle_unique(self, conn: sqlite3.Connection) -> None:
+        # users.handle was UNIQUE (a handle could own only one DID). Now a handle
+        # owns many DIDs, so handle must be non-unique. Rebuild `users` without
+        # the UNIQUE, but keep the table *name* 'users' so FK references from
+        # profiles/did_documents stay valid. We do DROP then RENAME back rather
+        # than ALTER RENAME, because ALTER RENAME would rewrite those REFERENCES
+        # to a `<old>_old` name and leave them dangling.
+        handle_unique = False
+        for index in conn.execute("PRAGMA index_list(users)").fetchall():
+            if not index["unique"]:
+                continue
+            cols = [c["name"] for c in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
+            if cols == ["handle"]:
+                handle_unique = True
+                break
+        if not handle_unique:
+            return
+        info = conn.execute("PRAGMA table_info(users)").fetchall()
+        cols = [r["name"] for r in info]
+        defs = []
+        for r in info:
+            parts = [f'"{r["name"]}"', r["type"] or ""]
+            if r["notnull"]:
+                parts.append("NOT NULL")
+            if r["dflt_value"] is not None:
+                parts.append(f"DEFAULT {r['dflt_value']}")
+            if r["pk"]:
+                parts.append("PRIMARY KEY")
+            defs.append(" ".join(parts).strip())
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("CREATE TABLE users_new (" + ", ".join(defs) + ")")
+            conn.execute(f"INSERT INTO users_new ({', '.join(cols)}) SELECT {', '.join(cols)} FROM users")
+            conn.execute("DROP TABLE users")
+            conn.execute("ALTER TABLE users_new RENAME TO users")
+            conn.commit()
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("CREATE INDEX IF NOT EXISTS users_handle_idx ON users(handle)")
 
     def seed_groups(self, conn: sqlite3.Connection, did_domain: str = "localhost") -> None:
         group_did = f"did:wba:{did_domain}:groups:open"

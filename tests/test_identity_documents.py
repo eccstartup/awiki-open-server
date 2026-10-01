@@ -206,6 +206,7 @@ async def test_did_registration_policy_rejects_non_e1_domain_conflicts_and_publi
         assert unsigned["error"]["message"] == "unsigned_did_document_requires_dev_mode"
 
         generated = await rpc(strict_client, "/did-auth/rpc", "register", {"handle": "strict-generated"})
+        # The keyless auto-generated path needs no challenge signature.
         assert generated["result"]["did"] == "did:wba:testserver:users:strict-generated:e1_default"
 
 
@@ -321,6 +322,8 @@ async def test_signed_did_document_cryptographic_proof_rejects_tamper_and_invali
     bad_document["service"][0]["serviceEndpoint"] = "http://testserver/anp-im/rpc"
     bad_document["service"][0]["serviceDid"] = "did:wba:testserver"
     bad_document = sign_did_document(bad_document, bad_key)
+    # `proofValue` is base64url here, matching the pinned ANP SDK's DID Document
+    # proof verification; a value that is not decodable base64url is rejected.
     bad_document["proof"]["proofValue"] = "not-valid-base64url!"
     rejected_bad_value = await rpc(
         client,
@@ -572,3 +575,31 @@ async def test_unsupported_identity_methods(client):
     reg = await rpc(client, "/did-auth/rpc", "register", {"handle": "bob"})
     response = await rpc(client, "/did-auth/rpc", "recover_handle", token=reg["result"]["token"])
     assert response["error"]["message"] == "not_supported"
+
+
+@pytest.mark.asyncio
+async def test_stable_subject_path_resolves_to_the_current_did(client):
+    reg = await rpc(client, "/did-auth/rpc", "register", {"handle": "carol"})
+    did = reg["result"]["did"]
+    assert did.startswith("did:wba:testserver:users:carol:")
+
+    exact = await client.get("/dids/resolve/users/carol/e1_default/did.json")
+    assert exact.status_code == 200
+    assert exact.json()["id"] == did
+
+    # 稳定主体路径（ANP-03 §2.2.3）：去掉最后的绑定指纹段，仍取到该主体当前那条 DID
+    subject = await client.get("/users/carol/did.json")
+    assert subject.status_code == 200
+    assert subject.json()["id"] == did
+
+    subject_compat = await client.get("/dids/resolve/users/carol/did.json")
+    assert subject_compat.status_code == 200
+    assert subject_compat.json()["id"] == did
+
+    # 前缀不能越界匹配另一个主体
+    await rpc(client, "/did-auth/rpc", "register", {"handle": "carolyn"})
+    assert (await client.get("/users/carol/did.json")).json()["id"] == did
+
+    missing = await client.get("/users/nobody/did.json")
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "did_document_not_found"

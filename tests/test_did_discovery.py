@@ -17,7 +17,15 @@ def test_did_resolution_preserves_full_authority_and_path(method):
     assert did_resolution_authority(did) == "example.test:8443"
     assert did_resolution_url(did) == "https://example.test:8443/users/alice/did.json"
     assert did_resolution_url(f"did:{method}:example.test") == "https://example.test/.well-known/did.json"
-    assert not runtime._did_belongs_to_domain(did, "example.test")
+    # Membership compares the DID's domain (authority minus port), so a
+    # port-bearing authority on this domain still counts as local. The port is
+    # preserved for document resolution above; only the ownership check is
+    # port-insensitive, which is what makes a local deployment on a non-default
+    # port (localhost%3A8765) recognise its own DIDs.
+    if method == "wba":
+        assert runtime._did_belongs_to_domain(did, "example.test")
+    else:
+        assert not runtime._did_belongs_to_domain(did, "example.test")
     assert not runtime._did_belongs_to_domain("did:web:example.test:users:alice", "example.test")
 
 
