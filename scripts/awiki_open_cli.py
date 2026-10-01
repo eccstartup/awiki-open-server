@@ -161,6 +161,23 @@ def default_group_did(did_domain: str) -> str:
     return f"did:wba:{did_domain}:groups:open"
 
 
+def service_did_for(base_url: str, did_domain: str) -> str:
+    """The service DID a server started on `base_url` publishes.
+
+    A non-default port belongs to the DID host segment (ANP-03 §2.1), and the
+    server derives it from its own declared base URL, so `--base-url
+    http://127.0.0.1:8765` means `did:wba:<domain>%3A8765`.
+    """
+    parsed = urllib.parse.urlsplit(base_url)
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is None or port == (443 if parsed.scheme == "https" else 80):
+        return f"did:wba:{did_domain}"
+    return f"did:wba:{did_domain}%3A{port}"
+
+
 def b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
@@ -2174,7 +2191,7 @@ def smoke_asgi(args: argparse.Namespace) -> int:
 
 def verify_public(args: argparse.Namespace) -> int:
     base = args.base_url.rstrip("/")
-    expected_service_did = args.service_did or f"did:wba:{args.did_domain}"
+    expected_service_did = args.service_did or service_did_for(args.base_url, args.did_domain)
     expected_endpoint = f"{base}/anp-im/rpc"
     checks: list[dict] = []
 

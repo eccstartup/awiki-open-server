@@ -114,6 +114,65 @@ def test_verify_public_accepts_open_server_surface(monkeypatch, capsys):
     assert '"ok": true' in output
 
 
+def test_verify_public_derives_port_bearing_service_did_from_base_url(monkeypatch, capsys):
+    service_did = "did:wba:localhost%3A8765"
+
+    def fake_http_get_json(base_url: str, path: str):
+        assert base_url == "http://127.0.0.1:8765"
+        return 200, {
+            "id": service_did,
+            "verificationMethod": [{"id": service_did + "#key-1"}],
+            "authentication": [service_did + "#key-1"],
+            "service": [
+                {
+                    "type": "ANPMessageService",
+                    "serviceEndpoint": "http://127.0.0.1:8765/anp-im/rpc",
+                    "serviceDid": service_did,
+                    "authSchemes": ["bearer", "didwba"],
+                }
+            ],
+        }
+
+    class FakeHealth:
+        status = 200
+
+        def read(self):
+            return b'{"status":"ok"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_urlopen(url: str, timeout: int):
+        assert url == "http://127.0.0.1:8765/healthz"
+        return FakeHealth()
+
+    def fake_anp_rpc(base_url: str, method: str, params: dict, token=None):
+        return {
+            "service_did": service_did,
+            "features": {
+                "cross_domain_direct": {"enabled": True},
+                "cross_domain_group": {"enabled": True, "mode": "did_discovery_direct_call"},
+                "group_participant": {
+                    "enabled": True,
+                    "management": True,
+                    "join_modes": ["open-join", "admin-add"],
+                },
+            },
+            "disabled_features": {"federation_relay": "commercial"},
+        }
+
+    monkeypatch.setattr(awiki_open_cli, "http_get_json", fake_http_get_json)
+    monkeypatch.setattr(awiki_open_cli.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(awiki_open_cli, "anp_rpc", fake_anp_rpc)
+
+    args = argparse.Namespace(base_url="http://127.0.0.1:8765", did_domain="localhost", service_did=None)
+    assert verify_public(args) == 0
+    assert '"ok": true' in capsys.readouterr().out
+
+
 def test_verify_public_rejects_domain_not_serving_open_server(monkeypatch, capsys):
     def fake_http_get_json(base_url: str, path: str):
         return 404, {"detail": "Server DID document not found"}
