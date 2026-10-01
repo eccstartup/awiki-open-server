@@ -695,3 +695,49 @@ async def test_startup_audit_disables_stored_documents_with_unverifiable_proof(t
         create_app(settings)
     assert [record for record in caplog.records if "did_documents_unverifiable_proof" in record.getMessage()] == []
     assert status_of(legacy["id"]) == "unverifiable_proof"
+
+
+@pytest.mark.asyncio
+async def test_reregistering_a_withdrawn_subject_restores_resolution(tmp_path, caplog):
+    settings = Settings(
+        data_dir=tmp_path,
+        public_base_url="http://testserver",
+        service_did="did:wba:testserver",
+        did_domain="testserver",
+        service_private_key_pem=generate_ed25519_private_key_pem(),
+        allow_unsigned_peer_dev=True,
+    )
+    store = Store(settings.db_path, settings.did_domain)
+    legacy = _stored_document(
+        "did:wba:testserver:users:restore",
+        encode=lambda signature: base64.urlsafe_b64encode(signature).rstrip(b"=").decode(),
+    )
+    did = legacy["id"]
+    sub_path = did.removeprefix("did:wba:testserver:")
+    with store.connect() as conn:
+        conn.execute(
+            "INSERT INTO did_documents(did, document_json, updated_at) VALUES (?, ?, ?)",
+            (did, json.dumps(legacy), "2026-01-01T00:00:00Z"),
+        )
+
+    with caplog.at_level(logging.WARNING, logger="awiki_open_server.app.main"):
+        app = create_app(settings)
+    reported = [record.getMessage() for record in caplog.records if "did_documents_unverifiable_proof" in record.getMessage()]
+    assert len(reported) == 1 and did in reported[0]
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as async_client:
+        assert (await async_client.get(f"/dids/resolve/{sub_path}/did.json")).status_code == 404
+
+        # 一个 handle = 一份 ad.json，重注册 upsert 整份聚合文档并清掉停用状态
+        ad = {"id": did, "dids": [did], "verificationMethod": [], "service": []}
+        registered = await rpc(async_client, "/did-auth/rpc", "register", {"handle": "restore@testserver", "ad": ad})
+        assert registered["result"]["did"] == did
+
+        resolved = await async_client.get(f"/dids/resolve/{sub_path}/did.json")
+        assert resolved.status_code == 200
+        assert resolved.json()["id"] == did
+
+    with store.connect() as conn:
+        status = conn.execute("SELECT status FROM did_documents WHERE did = ?", (did,)).fetchone()["status"]
+    assert status == "active"

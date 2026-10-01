@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import base64
 import copy
+import json
+import logging
 
+import base58
 import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -11,7 +14,9 @@ from awiki_open_server.app.main import create_app
 from awiki_open_server.app.settings import Settings
 import pytest_asyncio
 
+from awiki_open_server.protocol.anp_adapter import ed25519_root_fingerprint
 from awiki_open_server.service_identity import generate_ed25519_private_key_pem
+from awiki_open_server.storage.db import Store
 from tests.conftest import rpc
 from tests.helpers import _multikey, sign_did_document
 
@@ -242,4 +247,68 @@ async def test_aggregate_register_primary_transfer_by_member(strict_client):
     })
     assert regX.get("error"), regX
     assert regX["error"]["message"] == "handle_already_registered"
+
+
+@pytest.mark.asyncio
+async def test_strict_reregister_restores_a_withdrawn_subject(tmp_path, caplog):
+    """A withdrawn subject comes back by re-registering under its own key.
+
+    Strict mode is the production shape: the aggregate ad must be signed by the
+    subject's key, so only the key holder can put a withdrawn DID back into
+    resolution. Dev mode is covered separately in test_identity_documents.py.
+    """
+    settings = Settings(
+        data_dir=tmp_path,
+        public_base_url="http://testserver",
+        service_did="did:wba:testserver",
+        did_domain="testserver",
+        service_private_key_pem=generate_ed25519_private_key_pem(),
+        allow_unsigned_peer_dev=False,
+    )
+    store = Store(settings.db_path, settings.did_domain)
+    domain, local = "testserver", "agg-restore"
+    key = ed25519.Ed25519PrivateKey.generate()
+    did = f"did:wba:{domain}:users:{local}:e1_{ed25519_root_fingerprint(key.public_key())}"
+    document = {
+        "id": did,
+        "verificationMethod": [
+            {"id": f"{did}#key-1", "type": "Multikey", "controller": did, "publicKeyMultibase": _multikey(key.public_key())}
+        ],
+        "authentication": [f"{did}#key-1"],
+        "assertionMethod": [f"{did}#key-1"],
+        "service": [],
+    }
+    legacy = sign_did_document(document, key)
+    # The pre-1.2 encoding of the same signature: still resolvable, but no peer
+    # can verify it, so the next startup withdraws the document.
+    legacy["proof"]["proofValue"] = base64.urlsafe_b64encode(base58.b58decode(legacy["proof"]["proofValue"][1:])).rstrip(b"=").decode()
+    with store.connect() as conn:
+        conn.execute(
+            "INSERT INTO did_documents(did, document_json, updated_at) VALUES (?, ?, ?)",
+            (did, json.dumps(legacy), "2026-01-01T00:00:00Z"),
+        )
+
+    with caplog.at_level(logging.WARNING, logger="awiki_open_server.app.main"):
+        app = create_app(settings)
+    reported = [record.getMessage() for record in caplog.records if "did_documents_unverifiable_proof" in record.getMessage()]
+    assert len(reported) == 1 and did in reported[0]
+    assert "did_document_proof_value_invalid" in reported[0]
+
+    sub_path = f"users/{local}/{did.rsplit(':', 1)[-1]}"
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as async_client:
+        assert (await async_client.get(f"/dids/resolve/{sub_path}/did.json")).status_code == 404
+
+        ad = _aggregate_ad(local, domain, did, [(did, key)], signed_with=key)
+        registered = await rpc(async_client, "/did-auth/rpc", "register", {"handle": local, "ad": ad})
+        assert "error" not in registered, registered
+        assert registered["result"]["did"] == did
+
+        resolved = await async_client.get(f"/dids/resolve/{sub_path}/did.json")
+        assert resolved.status_code == 200
+        assert resolved.json()["id"] == did
+
+    with store.connect() as conn:
+        status = conn.execute("SELECT status FROM did_documents WHERE did = ?", (did,)).fetchone()["status"]
+    assert status == "active"
 
