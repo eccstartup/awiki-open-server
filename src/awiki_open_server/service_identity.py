@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import base58
 import binascii
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from cryptography.hazmat.primitives.serialization import (
 from awiki_open_server.protocol.anp_adapter import (
     AnpProtocolError,
     build_content_digest as anp_build_content_digest,
+    ed25519_root_fingerprint,
     find_verification_method,
     generate_service_http_signature_headers,
     has_verification_method,
@@ -33,10 +35,6 @@ from awiki_open_server.protocol.anp_adapter import (
 )
 from awiki_open_server.protocol.registry import STANDARD_PROFILES
 from awiki_open_server.shared.errors import InvalidParams, Unauthorized
-
-
-def _b64u(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
 def _b64u_decode(value: str) -> bytes:
@@ -58,16 +56,12 @@ def _canonical_json(value: Any) -> bytes:
 def _multikey_ed25519(public_key: ed25519.Ed25519PublicKey) -> str:
     raw = public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
     # multicodec ed25519-pub varint prefix: 0xed 0x01
-    import base58
-
     return "z" + base58.b58encode(b"\xed\x01" + raw).decode("ascii")
 
 
 def _ed25519_public_key_from_multikey(value: Any) -> ed25519.Ed25519PublicKey:
     if not isinstance(value, str) or not value.startswith("z"):
         raise InvalidParams("did_document_proof_public_key_not_supported")
-    import base58
-
     try:
         decoded = base58.b58decode(value[1:])
     except Exception as exc:
@@ -78,25 +72,25 @@ def _ed25519_public_key_from_multikey(value: Any) -> ed25519.Ed25519PublicKey:
 
 
 def _encode_proof_value(signature: bytes) -> str:
-    """`proofValue` as base64url without padding.
+    """`proofValue` as base58-btc multibase, per ANP-03 §2.5.5.
 
-    The pinned ANP SDK (anp 1.0.3) verifies DID Document DataIntegrityProofs by
-    base64url-decoding `proofValue` (`anp.proof.proof.verify_w3c_proof`, reached
-    through `validate_did_document_binding`), so that is the encoding this server
-    must emit and accept. Multibase base58 (`z...`) belongs to the SDK's *object*
-    proofs — group receipts, DID-WBA bindings — a different proof family.
+    §2.5.5 fixes the `e1_` DID Document proof profile to DataIntegrityProof +
+    eddsa-jcs-2022 and requires `proofValue` in base58-btc multibase (`z...`).
+    The pinned ANP SDK verifies `e1_` proofs through
+    `anp.proof.proof.verify_w3c_proof`, which base64url-decodes instead, so the
+    SDK's binding check is replaced by `validate_e1_document_binding` rather
+    than treated as authoritative.
     """
-    return _b64u(signature)
+    return "z" + base58.b58encode(signature).decode("ascii")
 
 
 def _decode_proof_value(value: Any, *, code: str = "did_document_proof_value_invalid") -> bytes:
-    """Base64url-decode a `proofValue` (with or without padding)."""
-    if not isinstance(value, str) or not value:
+    """Base58-btc-decode a `proofValue` written as multibase (`z...`)."""
+    if not isinstance(value, str) or not value.startswith("z"):
         raise InvalidParams(code)
-    padding = "=" * (-len(value) % 4)
     try:
-        return base64.b64decode((value + padding).encode("ascii"), altchars=b"-_", validate=True)
-    except (binascii.Error, UnicodeEncodeError, ValueError) as exc:
+        return base58.b58decode(value[1:])
+    except (ValueError, TypeError) as exc:
         raise InvalidParams(code) from exc
 
 
@@ -236,6 +230,80 @@ def verify_did_document_data_integrity_proof(
         public_key.verify(signature, signing_input)
     except InvalidSignature as exc:
         raise InvalidParams("did_document_proof_invalid") from exc
+
+
+def validate_e1_document_binding(document: dict[str, Any]) -> None:
+    """ANP-03 §2.5.5 binding check for an active `e1_` DID Document.
+
+    The document's own `proof` must verify, and the key that signed it must hash
+    to the DID's trailing `e1_<fingerprint>` path segment, so path binding,
+    public-key binding and document integrity are checked as one thing.
+    """
+    did = document.get("id")
+    if not isinstance(did, str) or not did:
+        raise InvalidParams("did_document_id_required")
+    segment = did.rsplit(":", 1)[-1]
+    if not segment.startswith("e1_"):
+        raise InvalidParams("did_document_binding_invalid")
+    verify_did_document_data_integrity_proof(document)
+    method = find_verification_method(document, document["proof"]["verificationMethod"])
+    public_key = _ed25519_public_key_from_multikey(method.get("publicKeyMultibase"))
+    if ed25519_root_fingerprint(public_key) != segment[3:]:
+        raise InvalidParams("did_document_e1_binding_mismatch")
+
+
+def verify_object_proof(
+    document: dict[str, Any],
+    *,
+    issuer_did: str,
+    issuer_did_document: dict[str, Any],
+) -> None:
+    """Verify an Appendix-B object proof, e.g. a Group receipt.
+
+    The signing input is identical to the DID Document DataIntegrityProof — the
+    difference is only who signs: the key is authorized by `issuer_did_document`
+    through `assertionMethod` rather than being the document's own binding key.
+    `proofValue` is base58-btc multibase here too (ANP-03 §2.5.5); the pinned
+    SDK's own object-proof verifier re-checks the issuer document's `e1_` binding
+    with base64url, so it cannot be used for base58 issuers.
+    """
+    if issuer_did_document.get("id") != issuer_did:
+        raise InvalidParams("object_proof_issuer_mismatch")
+
+    proof = document.get("proof")
+    if not isinstance(proof, dict):
+        raise InvalidParams("object_proof_required")
+    if proof.get("type") != "DataIntegrityProof":
+        raise InvalidParams("object_proof_type_not_supported")
+    if proof.get("cryptosuite") != "eddsa-jcs-2022":
+        raise InvalidParams("object_proof_cryptosuite_not_supported")
+    if proof.get("proofPurpose") != "assertionMethod":
+        raise InvalidParams("object_proof_purpose_not_supported")
+    if not isinstance(proof.get("created"), str) or not proof.get("created"):
+        raise InvalidParams("object_proof_created_required")
+
+    verification_method = proof.get("verificationMethod")
+    if not isinstance(verification_method, str) or not verification_method.startswith(f"{issuer_did}#"):
+        raise InvalidParams("object_proof_verification_method_mismatch")
+    if not is_verification_method_authorized(issuer_did_document, verification_method, "assertionMethod"):
+        raise InvalidParams("object_proof_verification_method_unauthorized")
+    method = find_verification_method(issuer_did_document, verification_method)
+    if method is None:
+        raise InvalidParams("object_proof_verification_method_missing")
+    if method.get("type") != "Multikey":
+        raise InvalidParams("object_proof_public_key_not_supported")
+
+    public_key = _ed25519_public_key_from_multikey(method.get("publicKeyMultibase"))
+    signature = _decode_proof_value(proof.get("proofValue"), code="object_proof_value_invalid")
+    if len(signature) != 64:
+        raise InvalidParams("object_proof_value_invalid")
+    proof_options = {k: v for k, v in proof.items() if k != "proofValue"}
+    unsigned = {k: v for k, v in document.items() if k != "proof"}
+    signing_input = _sha256(_canonical_json(proof_options)) + _sha256(_canonical_json(unsigned))
+    try:
+        public_key.verify(signature, signing_input)
+    except InvalidSignature as exc:
+        raise InvalidParams("object_proof_invalid") from exc
 
 
 def verify_handle_ad_proof(ad: dict[str, Any], submitting_did: str) -> None:

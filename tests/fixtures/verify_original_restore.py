@@ -4,9 +4,9 @@ from pathlib import Path
 import sys
 import httpx
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
-from anp.proof import verify_group_receipt_proof
 from awiki_open_server.app.main import create_app
 from awiki_open_server.app.settings import Settings
+from awiki_open_server.protocol.anp_adapter import verify_group_receipt
 from tests.test_group_host import _group_rpc
 
 async def run(root):
@@ -20,7 +20,7 @@ async def run(root):
         assert 'result' in result
         assert int(result['result']['group_event_seq'])==int(seed['messages'][-1]['group_event_seq'])+1
         doc=(await client.get('/'+seed['group_did'][len('did:wba:testserver:'):].replace(':','/')+'/did.json')).json()
-        assert verify_group_receipt_proof(result['result']['group_receipt'],doc)
+        assert verify_group_receipt(result['result']['group_receipt'],issuer_did_document=doc)
         with app.state.store.connect() as conn:
             assert 'wire_profile' not in {row[1] for row in conn.execute('PRAGMA table_info(hosted_groups)')}
     print(json.dumps({'original_binary_restored':True,'new_v1_send_verified':True}))

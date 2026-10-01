@@ -40,6 +40,13 @@ def _b64u(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
+def _b58(data: bytes) -> str:
+    """base58-btc multibase, the `proofValue` encoding ANP-03 §2.5.5 requires."""
+    import base58
+
+    return "z" + base58.b58encode(data).decode("ascii")
+
+
 def _multikey(public_key: ed25519.Ed25519PublicKey) -> str:
     import base58
 
@@ -65,7 +72,7 @@ def sign_did_document(
     unsigned = copy.deepcopy({k: v for k, v in document.items() if k != "proof"})
     signing_input = hashlib.sha256(jcs.canonicalize(proof)).digest() + hashlib.sha256(jcs.canonicalize(unsigned)).digest()
     signed = copy.deepcopy(document)
-    signed["proof"] = {**proof, "proofValue": _b64u(private_key.sign(signing_input))}
+    signed["proof"] = {**proof, "proofValue": _b58(private_key.sign(signing_input))}
     return signed
 
 

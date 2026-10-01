@@ -16,8 +16,7 @@ import base58
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
-from anp.proof import verify_group_receipt_proof
-from awiki_open_server.protocol.anp_adapter import did_resolution_url, require_did_document_binding
+from awiki_open_server.protocol.anp_adapter import did_resolution_url, require_did_document_binding, verify_group_receipt
 from awiki_open_server.service_identity import verify_peer_http_signature, validate_origin_proof_structure
 from awiki_open_server.service_identity import generate_ed25519_private_key_pem, _sign_did_document
 from cryptography.hazmat.primitives.serialization import load_pem_private_key, Encoding, PublicFormat
@@ -127,7 +126,7 @@ def create_app():
             else:
                 if meta.get('profile')!='anp.group.base.v2':raise ValueError('wrong group profile')
                 group=body['group_did'];receipt=body['group_receipt']
-                if not verify_group_receipt_proof(receipt,await document(group)):raise ValueError('invalid Receipt')
+                if not verify_group_receipt(receipt,issuer_did_document=await document(group)):raise ValueError('invalid Receipt')
                 if receipt['group_did']!=group or receipt['group_event_seq']!=body['group_event_seq'] or receipt['group_state_version']!=body['group_state_version']:
                     raise ValueError('Receipt binding mismatch')
                 if receipt.get('subject_method') != ('group.send' if method=='group.incoming' else body.get('subject_method')):

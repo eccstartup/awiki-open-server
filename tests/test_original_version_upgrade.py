@@ -16,12 +16,12 @@ import zipfile
 
 import httpx
 import pytest
-from anp.proof import verify_group_receipt_proof
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from awiki_open_server.app.main import create_app
 from awiki_open_server.app.settings import Settings
 from awiki_open_server.messaging.groups.migration import inspect_group, prepare_group, apply_group
+from awiki_open_server.protocol.anp_adapter import verify_group_receipt
 from tests.conftest import rpc
 from tests.test_group_v2 import group_call
 
@@ -107,7 +107,7 @@ async def test_original_version_data_survives_schema_and_group_protocol_upgrade(
         for index, (old, served) in enumerate(zip(seed['messages'], old_history)):
             assert served['body'] == {'text':f'old message {index}'}
             assert served['group_receipt'] == old['group_receipt']
-            assert verify_group_receipt_proof(served['group_receipt'], old_document)
+            assert verify_group_receipt(served['group_receipt'], issuer_did_document=old_document)
         ticket = await rpc(client, '/im/rpc', 'attachment.get_download_ticket', {'object_id':seed['object_id']}, token=owner['token'])
         assert 'result' in ticket
         download = await client.get('/objects/' + seed['object_id'], params={'ticket':ticket['result']['ticket']})

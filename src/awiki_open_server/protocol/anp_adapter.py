@@ -62,7 +62,6 @@ from anp.authentication import (  # noqa: E402
     verify_http_message_signature as _sdk_verify_http_message_signature,
 )
 from anp.proof import generate_group_receipt_proof as _sdk_generate_group_receipt_proof  # noqa: E402
-from anp.proof import verify_group_receipt_proof as _sdk_verify_group_receipt_proof  # noqa: E402
 from anp.wns import (  # noqa: E402
     canonicalize_binding_generation as _sdk_canonicalize_binding_generation,
     compare_binding_generations as _sdk_compare_binding_generations,
@@ -85,6 +84,8 @@ from anp.authentication.device_manifest import (  # noqa: E402
 from anp.authentication.did_wba import validate_did_document_binding as _sdk_validate_did_document_binding  # noqa: E402
 from anp.authentication.did_wba import compute_multikey_fingerprint as _sdk_compute_multikey_fingerprint  # noqa: E402
 from anp.authentication.did_resolver import build_did_resolution_url as _sdk_build_did_resolution_url  # noqa: E402
+
+from awiki_open_server.shared.errors import InvalidParams  # noqa: E402
 
 
 class AnpProtocolError(ValueError):
@@ -116,9 +117,32 @@ class SingleDeviceManifest:
     key_fingerprint: str
 
 
-def require_did_document_binding(document: Mapping[str, Any]) -> None:
+def _e1_document_binding_valid(document: Mapping[str, Any]) -> bool:
+    """Check an `e1_` DID Document with our own ANP-03 §2.5.5 verifier.
+
+    The pinned SDK routes `e1_` binding through
+    `anp.proof.proof.verify_w3c_proof`, which base64url-decodes `proofValue`,
+    while §2.5.5 requires base58-btc multibase. Its verdict is therefore not
+    usable for `e1_` documents and this server checks them itself.
+    """
+    from awiki_open_server.service_identity import validate_e1_document_binding
+
     try:
-        valid = _sdk_validate_did_document_binding(dict(document))
+        validate_e1_document_binding(dict(document))
+    except Exception:
+        return False
+    return True
+
+
+def require_did_document_binding(document: Mapping[str, Any]) -> None:
+    payload = dict(document)
+    did = payload.get("id")
+    if isinstance(did, str) and did.rsplit(":", 1)[-1].startswith("e1_"):
+        if not _e1_document_binding_valid(payload):
+            raise AnpProtocolError("did_document_binding_invalid")
+        return
+    try:
+        valid = _sdk_validate_did_document_binding(payload)
     except (TypeError, ValueError, KeyError) as exc:
         raise AnpProtocolError("did_document_binding_invalid") from exc
     if not valid:
@@ -222,7 +246,7 @@ def validate_single_device_document(document: Mapping[str, Any]) -> SingleDevice
         did = validated["id"]
         if did.startswith("did:wba:") and not did.rsplit(":", 1)[-1].startswith("e1_"):
             raise ValueError("local device identity requires an e1 binding")
-        if not _sdk_validate_did_document_binding(dict(document)):
+        if not _e1_document_binding_valid(document):
             raise ValueError("DID root fingerprint/proof binding is invalid")
         root_id = validated["proof"]["verificationMethod"]
         if root_id in {device.signing_key_id, device.e2ee_key_id} or device.signing_key_id == f"{did}#key-1":
@@ -299,7 +323,26 @@ def create_group_did_identity(
     private_key = keys.get("key-1", (None, None))[0]
     if not isinstance(private_key, bytes):
         raise AnpProtocolError("group_identity_key_missing")
-    return dict(document), private_key.decode("ascii")
+    # ANP-03 §2.5.5 fixes `proofValue` to base58-btc multibase for `e1_`
+    # documents; the SDK mints this proof as base64url, so re-sign it and keep
+    # user and group DID Documents on one encoding.
+    return _resign_e1_document(dict(document), private_key), private_key.decode("ascii")
+
+
+def _resign_e1_document(document: dict[str, Any], private_key_pem: bytes) -> dict[str, Any]:
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+    from awiki_open_server.service_identity import _sign_did_document
+
+    key = load_pem_private_key(private_key_pem, password=None)
+    if not isinstance(key, ed25519.Ed25519PrivateKey):
+        raise AnpProtocolError("group_identity_key_missing")
+    proof = document.get("proof")
+    key_id = proof.get("verificationMethod") if isinstance(proof, dict) else None
+    if not isinstance(key_id, str) or not key_id:
+        key_id = f"{document.get('id')}#key-1"
+    return _sign_did_document(document, key, key_id)
 
 
 def sign_group_receipt(
@@ -323,10 +366,27 @@ def verify_group_receipt(
     *,
     issuer_did_document: Mapping[str, Any],
 ) -> bool:
+    """Verify a Group receipt against the issuing group's DID Document.
+
+    Verified with our own Appendix-B implementation: the SDK's
+    `verify_group_receipt_proof` re-validates the issuer's `e1_` binding through
+    `verify_w3c_proof` (base64url), which cannot accept the base58-btc multibase
+    `e1_` documents ANP-03 §2.5.5 requires.
+    """
+    from awiki_open_server.service_identity import verify_object_proof
+
     try:
-        return bool(_sdk_verify_group_receipt_proof(dict(receipt), _method_lookup_document(issuer_did_document)))
-    except (AnpProtocolError, TypeError, ValueError):
+        issuer_did = receipt.get("group_did")
+        if not isinstance(issuer_did, str) or not issuer_did:
+            return False
+        verify_object_proof(
+            dict(receipt),
+            issuer_did=issuer_did,
+            issuer_did_document=_method_lookup_document(issuer_did_document),
+        )
+    except (AnpProtocolError, InvalidParams, TypeError, ValueError):
         return False
+    return True
 
 
 def normalize_wns_handle(handle: str) -> str:

@@ -9,7 +9,6 @@ import sys
 
 import httpx
 import pytest
-from anp.proof import verify_group_receipt_proof
 
 import awiki_open_server.messaging.groups.service as group_service
 import awiki_open_server.messaging.groups.outbox as group_outbox
@@ -18,6 +17,7 @@ from awiki_open_server.app.main import create_app
 from awiki_open_server.app.settings import Settings
 from awiki_open_server.messaging.groups.identity import VerifiedHandleBinding
 from awiki_open_server.messaging.groups.outbox import drain_group_outbox_once
+from awiki_open_server.protocol.anp_adapter import verify_group_receipt
 from awiki_open_server.service_identity import (
     build_service_did_document,
     generate_ed25519_private_key_pem,
@@ -153,7 +153,7 @@ async def test_managed_group_lifecycle_permissions_versions_and_receipts(client)
     group_document = (await client.get(document_path)).json()
     assert group_document["id"] == group_did
     assert group_document["service"][0]["serviceDid"] == "did:wba:testserver"
-    assert verify_group_receipt_proof(group["group_receipt"], group_document) is True
+    assert verify_group_receipt(group["group_receipt"], issuer_did_document=group_document) is True
     with client._transport.app.state.store.connect() as conn:
         key_reference = conn.execute(
             "SELECT key_reference FROM group_did_documents WHERE group_did = ?",

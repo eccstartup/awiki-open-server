@@ -322,9 +322,9 @@ async def test_signed_did_document_cryptographic_proof_rejects_tamper_and_invali
     bad_document["service"][0]["serviceEndpoint"] = "http://testserver/anp-im/rpc"
     bad_document["service"][0]["serviceDid"] = "did:wba:testserver"
     bad_document = sign_did_document(bad_document, bad_key)
-    # `proofValue` is base64url here, matching the pinned ANP SDK's DID Document
-    # proof verification; a value that is not decodable base64url is rejected.
-    bad_document["proof"]["proofValue"] = "not-valid-base64url!"
+    # ANP-03 §2.5.5 requires base58-btc multibase here; a value that carries no
+    # multibase prefix is rejected before any signature check happens.
+    bad_document["proof"]["proofValue"] = "not-base58-multibase!"
     rejected_bad_value = await rpc(
         client,
         "/user-service/did-auth/rpc",
