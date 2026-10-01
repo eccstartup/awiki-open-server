@@ -633,7 +633,8 @@ def test_did_document_proof_issue_only_covers_documents_that_claim_a_proof():
     assert did_document_proof_issue({"id": "did:wba:testserver:users:local:e1_default"}) is None
 
 
-def test_startup_audit_reports_stored_documents_with_unverifiable_proof(tmp_path, caplog):
+@pytest.mark.asyncio
+async def test_startup_audit_disables_stored_documents_with_unverifiable_proof(tmp_path, caplog):
     settings = Settings(
         data_dir=tmp_path,
         public_base_url="http://testserver",
@@ -657,7 +658,7 @@ def test_startup_audit_reports_stored_documents_with_unverifiable_proof(tmp_path
             )
 
     with caplog.at_level(logging.WARNING, logger="awiki_open_server.app.main"):
-        create_app(settings)
+        app = create_app(settings)
 
     reported = [
         record.getMessage()
@@ -669,3 +670,28 @@ def test_startup_audit_reports_stored_documents_with_unverifiable_proof(tmp_path
     assert "did_document_proof_value_invalid" in reported[0]
     assert conforming["id"] not in reported[0]
     assert proof_less["id"] not in reported[0]
+
+    # 停用后解析必须 404：文档无法被任何人验证，发出去只会让对端拿到坏身份
+    def status_of(did: str) -> str:
+        with store.connect() as conn:
+            row = conn.execute("SELECT status FROM did_documents WHERE did = ?", (did,)).fetchone()
+        return row["status"]
+
+    assert status_of(legacy["id"]) == "unverifiable_proof"
+    assert status_of(conforming["id"]) == "active"
+    # 无 proof 的本地兼容身份不属于本次检查，保持可解析
+    assert status_of(proof_less["id"]) == "active"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as async_client:
+        for document, expected in ((legacy, 404), (conforming, 200)):
+            sub_path = document["id"].removeprefix("did:wba:testserver:")
+            assert (await async_client.get(f"/dids/resolve/{sub_path}/did.json")).status_code == expected
+        assert (await async_client.get("/users/local/did.json")).status_code == 200
+
+    # 再次启动既不再告警，也不重复写库
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="awiki_open_server.app.main"):
+        create_app(settings)
+    assert [record for record in caplog.records if "did_documents_unverifiable_proof" in record.getMessage()] == []
+    assert status_of(legacy["id"]) == "unverifiable_proof"

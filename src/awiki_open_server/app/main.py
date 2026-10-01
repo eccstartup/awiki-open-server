@@ -21,14 +21,20 @@ logger = logging.getLogger(__name__)
 
 _LEGACY_PROOF_REPORT_LIMIT = 20
 
+# A document the server can no longer verify is withdrawn, not revoked: the
+# subject did nothing wrong, the encoding it registered under is no longer
+# accepted, and re-registering the same subject restores service. Resolution
+# must stop serving it because no peer can verify it either.
+UNVERIFIABLE_PROOF_STATUS = "unverifiable_proof"
+
 
 def report_unverifiable_did_documents(store: Store) -> list[tuple[str, str]]:
     """Find stored DID Documents a resolver can serve but nobody can verify.
 
     Documents registered before `proofValue` became base58-btc multibase
     (ANP-03 §2.5.5) keep resolving, so an upgrade would otherwise hand peers an
-    identity that fails their binding check. Report them once at startup; the
-    server holds no client key, so they can only be re-registered, not repaired.
+    identity that fails their binding check. The server holds no client key, so
+    they can only be re-registered, not repaired; startup withdraws them.
     """
     with store.connect() as conn:
         rows = conn.execute(
@@ -54,14 +60,35 @@ def _report_unverifiable_did_documents(store: Store) -> None:
     flagged = report_unverifiable_did_documents(store)
     if not flagged:
         return
+    disabled = disable_did_documents(store, [did for did, _ in flagged])
     shown = ", ".join(f"{did} ({issue})" for did, issue in flagged[:_LEGACY_PROOF_REPORT_LIMIT])
     logger.warning(
-        "did_documents_unverifiable_proof: %d active DID Document(s) fail proof verification "
-        "and must be re-registered; showing %d: %s",
-        len(flagged),
+        "did_documents_unverifiable_proof: disabled %d active DID Document(s) that fail proof "
+        "verification and must be re-registered; showing %d: %s",
+        disabled,
         min(len(flagged), _LEGACY_PROOF_REPORT_LIMIT),
         shown,
     )
+
+
+def disable_did_documents(store: Store, dids: list[str]) -> int:
+    """Stop a DID Document from resolving, so no peer is handed an invalid one.
+
+    The server holds no client key, so a document that fails proof verification
+    cannot be repaired — only withdrawn until its owner registers again. Returns
+    how many rows actually changed, which is 0 once this has already run.
+    """
+    if not dids:
+        return 0
+    with store.connect() as conn:
+        cursor = conn.executemany(
+            """
+            UPDATE did_documents SET status = ?
+            WHERE did = ? AND COALESCE(status, 'active') = 'active' AND revoked_at IS NULL
+            """,
+            [(UNVERIFIABLE_PROOF_STATUS, did) for did in dids],
+        )
+        return cursor.rowcount
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
