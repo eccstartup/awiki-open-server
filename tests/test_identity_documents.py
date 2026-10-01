@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import base64
+import copy
+import json
+import logging
+
+import base58
 import httpx
 import pytest
 
 from awiki_open_server.app.main import create_app
 from awiki_open_server.app.settings import Settings
-from awiki_open_server.service_identity import generate_ed25519_private_key_pem
+from awiki_open_server.service_identity import did_document_proof_issue, generate_ed25519_private_key_pem
+from awiki_open_server.storage.db import Store
 from tests.conftest import rpc
-from tests.helpers import did_keypair_document, sign_did_document
+from tests.helpers import bound_did_keypair_document, did_keypair_document, sign_did_document
 
 @pytest.mark.asyncio
 async def test_register_profile_and_page(client):
@@ -603,3 +610,62 @@ async def test_stable_subject_path_resolves_to_the_current_did(client):
     missing = await client.get("/users/nobody/did.json")
     assert missing.status_code == 404
     assert missing.json()["detail"] == "did_document_not_found"
+
+
+def _stored_document(did: str, *, encode) -> dict:
+    private_key, document = bound_did_keypair_document(did)
+    signed = sign_did_document(document, private_key)
+    if encode is not None:
+        signature = base58.b58decode(signed["proof"]["proofValue"][1:])
+        signed["proof"]["proofValue"] = encode(signature)
+    return signed
+
+
+def test_did_document_proof_issue_only_covers_documents_that_claim_a_proof():
+    conforming = _stored_document("did:wba:testserver:users:conforming", encode=None)
+    legacy = _stored_document(
+        "did:wba:testserver:users:legacy",
+        encode=lambda signature: base64.urlsafe_b64encode(signature).rstrip(b"=").decode(),
+    )
+    assert did_document_proof_issue(conforming) is None
+    assert did_document_proof_issue(legacy) == "did_document_proof_value_invalid"
+    # Local-compatibility identities carry no proof at all and are not part of this check.
+    assert did_document_proof_issue({"id": "did:wba:testserver:users:local:e1_default"}) is None
+
+
+def test_startup_audit_reports_stored_documents_with_unverifiable_proof(tmp_path, caplog):
+    settings = Settings(
+        data_dir=tmp_path,
+        public_base_url="http://testserver",
+        service_did="did:wba:testserver",
+        did_domain="testserver",
+        service_private_key_pem=generate_ed25519_private_key_pem(),
+        allow_unsigned_peer_dev=True,
+    )
+    store = Store(settings.db_path, settings.did_domain)
+    conforming = _stored_document("did:wba:testserver:users:conforming", encode=None)
+    legacy = _stored_document(
+        "did:wba:testserver:users:legacy",
+        encode=lambda signature: base64.urlsafe_b64encode(signature).rstrip(b"=").decode(),
+    )
+    proof_less = {"id": "did:wba:testserver:users:local:e1_default", "service": []}
+    with store.connect() as conn:
+        for document in (conforming, legacy, proof_less):
+            conn.execute(
+                "INSERT INTO did_documents(did, document_json, updated_at) VALUES (?, ?, ?)",
+                (document["id"], json.dumps(document), "2026-01-01T00:00:00Z"),
+            )
+
+    with caplog.at_level(logging.WARNING, logger="awiki_open_server.app.main"):
+        create_app(settings)
+
+    reported = [
+        record.getMessage()
+        for record in caplog.records
+        if "did_documents_unverifiable_proof" in record.getMessage()
+    ]
+    assert len(reported) == 1
+    assert legacy["id"] in reported[0]
+    assert "did_document_proof_value_invalid" in reported[0]
+    assert conforming["id"] not in reported[0]
+    assert proof_less["id"] not in reported[0]

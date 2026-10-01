@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import base58
 import binascii
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -250,6 +251,28 @@ def validate_e1_document_binding(document: dict[str, Any]) -> None:
     public_key = _ed25519_public_key_from_multikey(method.get("publicKeyMultibase"))
     if ed25519_root_fingerprint(public_key) != segment[3:]:
         raise InvalidParams("did_document_e1_binding_mismatch")
+
+
+def did_document_proof_issue(document: Any) -> str | None:
+    """The error code when a stored DID Document's proof no longer verifies.
+
+    `proofValue` must be base58-btc multibase (ANP-03 §2.5.5). Documents stored
+    under the base64url encoding that preceded that rule still resolve, but
+    neither this server nor a peer can verify them, so startup reports them
+    rather than letting resolution hand out an unverifiable identity. Documents
+    without a proof are local-compatibility identities, a separate case.
+    """
+    if not isinstance(document, Mapping) or not isinstance(document.get("proof"), Mapping):
+        return None
+    payload = dict(document)
+    try:
+        if str(payload.get("id", "")).rsplit(":", 1)[-1].startswith("e1_"):
+            validate_e1_document_binding(payload)
+        else:
+            verify_did_document_data_integrity_proof(payload)
+    except InvalidParams as exc:
+        return str(exc)
+    return None
 
 
 def verify_object_proof(

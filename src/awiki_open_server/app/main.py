@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
+import json
+import logging
 import threading
 
 from fastapi import FastAPI
@@ -9,11 +11,57 @@ from fastapi import FastAPI
 from awiki_open_server.app.api_contract import ApiContractMetrics, ApiContractMiddleware
 from awiki_open_server.app.realtime import RealtimeHub
 from awiki_open_server.app.settings import Settings, load_settings
-from awiki_open_server.service_identity import service_identity_from_settings
+from awiki_open_server.service_identity import did_document_proof_issue, service_identity_from_settings
 from awiki_open_server.messaging.groups.outbox import run_group_outbox
 from awiki_open_server.storage.db import Store
 from awiki_open_server.messaging.standard_sync import load_or_create_page_ref_key
 from awiki_open_server.user_compat.device_auth import load_token_signing_key
+
+logger = logging.getLogger(__name__)
+
+_LEGACY_PROOF_REPORT_LIMIT = 20
+
+
+def report_unverifiable_did_documents(store: Store) -> list[tuple[str, str]]:
+    """Find stored DID Documents a resolver can serve but nobody can verify.
+
+    Documents registered before `proofValue` became base58-btc multibase
+    (ANP-03 §2.5.5) keep resolving, so an upgrade would otherwise hand peers an
+    identity that fails their binding check. Report them once at startup; the
+    server holds no client key, so they can only be re-registered, not repaired.
+    """
+    with store.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT did, document_json FROM did_documents
+            WHERE COALESCE(status, 'active') = 'active' AND revoked_at IS NULL
+            """
+        ).fetchall()
+    flagged: list[tuple[str, str]] = []
+    for row in rows:
+        try:
+            document = json.loads(row["document_json"])
+        except ValueError:
+            flagged.append((row["did"], "did_document_unparsable"))
+            continue
+        issue = did_document_proof_issue(document)
+        if issue is not None:
+            flagged.append((row["did"], issue))
+    return flagged
+
+
+def _report_unverifiable_did_documents(store: Store) -> None:
+    flagged = report_unverifiable_did_documents(store)
+    if not flagged:
+        return
+    shown = ", ".join(f"{did} ({issue})" for did, issue in flagged[:_LEGACY_PROOF_REPORT_LIMIT])
+    logger.warning(
+        "did_documents_unverifiable_proof: %d active DID Document(s) fail proof verification "
+        "and must be re-registered; showing %d: %s",
+        len(flagged),
+        min(len(flagged), _LEGACY_PROOF_REPORT_LIMIT),
+        shown,
+    )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -23,6 +71,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings.group_key_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     settings.group_key_dir.chmod(0o700)
     store = Store(settings.db_path, settings.did_domain)
+    _report_unverifiable_did_documents(store)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
