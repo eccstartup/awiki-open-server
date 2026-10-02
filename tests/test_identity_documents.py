@@ -309,6 +309,76 @@ async def test_signed_cli_did_document_service_must_match_open_server(client):
 
 
 @pytest.mark.asyncio
+async def test_peer_declared_message_service_is_published_when_enabled(peer_declared_service_client):
+    """A DID hosted here may say its messages are handled somewhere else.
+
+    This is the shape that `allow_unsigned_peer_dev` alone cannot produce: the DID is
+    `did:wba:testserver:…`, so this server hosts the document, while the message
+    service sits at another operator. The default `client` fixture refuses exactly
+    this (`test_signed_cli_did_document_service_must_match_open_server`), so the two
+    tests together pin the setting rather than the code path.
+    """
+    client = peer_declared_service_client
+    did = "did:wba:testserver:peer-declared:e1_peer"
+    private_key, document = did_keypair_document(did)
+
+    registered = await rpc(
+        client,
+        "/user-service/did-auth/rpc",
+        "register",
+        {"handle": "peer-declared", "did_document": sign_did_document(document, private_key)},
+    )
+
+    assert "error" not in registered, registered
+    service = registered["result"]["document"]["service"][0]
+    assert service["serviceEndpoint"] == "https://awiki.info/anp-im/rpc"
+    assert service["serviceDid"] == "did:wba:awiki.info"
+
+    resolved = await client.get("/peer-declared/e1_peer/did.json")
+    assert resolved.status_code == 200
+    assert resolved.json()["service"][0]["serviceEndpoint"] == "https://awiki.info/anp-im/rpc"
+    assert resolved.json()["service"][0]["serviceDid"] == "did:wba:awiki.info"
+
+
+@pytest.mark.asyncio
+async def test_peer_declared_message_service_still_refuses_malformed_entries(peer_declared_service_client):
+    """Loosening who chooses the endpoint is not the same as publishing anything.
+
+    Nothing is compared against the values this server would have picked any more, so
+    the entry is checked on its own terms: the service DID has to be a DID and the
+    endpoint has to be an absolute http(s) URL with a host.
+    """
+    client = peer_declared_service_client
+    base_did = "did:wba:testserver:peer-declared-bad:e1_bad"
+    bad_service = {
+        "id": f"{base_did}#message",
+        "type": "ANPMessageService",
+        "profiles": ["anp.core.binding.v1", "anp.direct.base.v1"],
+        "serviceEndpoint": "https://agentx.example/anp-im/rpc",
+        "serviceDid": "did:wba:agentx.example",
+        "securityProfiles": ["transport-protected"],
+    }
+
+    def signed(service: dict) -> dict:
+        private_key, document = did_keypair_document(base_did)
+        return sign_did_document({**document, "service": [service]}, private_key)
+
+    for service, expected in (
+        ({**bad_service, "serviceDid": "agentx.example"}, "peer_declared_service_did_invalid"),
+        ({**bad_service, "serviceEndpoint": ""}, "peer_declared_service_endpoint_invalid"),
+        ({**bad_service, "serviceEndpoint": "not-a-url"}, "peer_declared_service_endpoint_invalid"),
+        ({**bad_service, "serviceEndpoint": "https://"}, "peer_declared_service_endpoint_invalid"),
+    ):
+        rejected = await rpc(
+            client,
+            "/user-service/did-auth/rpc",
+            "register",
+            {"handle": "peer-declared-bad", "did_document": signed(service)},
+        )
+        assert rejected["error"]["message"] == expected, service
+
+
+@pytest.mark.asyncio
 async def test_signed_did_document_cryptographic_proof_rejects_tamper_and_invalid_methods(client):
     did = "did:wba:testserver:signed-tamper:e1_cli"
     private_key, document = did_keypair_document(did)

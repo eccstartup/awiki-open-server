@@ -31,6 +31,7 @@ class Settings:
     service_private_key_pem: str | None = None
     service_did_document_json: str | None = None
     allow_unsigned_peer_dev: bool = False
+    allow_peer_declared_message_service: bool = False
     im_rpc_path: str = "/im/rpc"
     anp_public_rpc_path: str = "/anp-im/rpc"
     ws_path: str = "/im/ws"
@@ -133,6 +134,8 @@ def load_settings() -> Settings:
         service_private_key_pem=service_private_key_pem,
         service_did_document_json=os.environ.get("AWIKI_SERVICE_DID_DOCUMENT_JSON"),
         allow_unsigned_peer_dev=os.environ.get("AWIKI_ALLOW_UNSIGNED_PEER_DEV", "").lower() in {"1", "true", "yes"},
+        allow_peer_declared_message_service=os.environ.get("AWIKI_ALLOW_PEER_DECLARED_MESSAGE_SERVICE", "").lower()
+        in {"1", "true", "yes"},
         im_rpc_path=os.environ.get("AWIKI_IM_RPC_PATH", "/im/rpc"),
         anp_public_rpc_path=os.environ.get("AWIKI_ANP_PUBLIC_RPC_PATH", "/anp-im/rpc"),
         ws_path=os.environ.get("AWIKI_WS_PATH", "/im/ws"),

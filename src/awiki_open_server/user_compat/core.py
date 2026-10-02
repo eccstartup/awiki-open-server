@@ -333,6 +333,9 @@ def _ensure_anp_message_service(
         if len(services) != 1:
             raise InvalidParams("signed_did_document_requires_single_anp_message_service")
         service = services[0]
+        if settings.allow_peer_declared_message_service:
+            _check_peer_declared_message_service(service)
+            return doc
         if service.get("serviceEndpoint") != settings.anp_service_endpoint:
             raise InvalidParams(
                 "signed_did_document_service_endpoint_mismatch",
@@ -386,6 +389,32 @@ def _anp_message_services(document: dict[str, Any]) -> list[dict[str, Any]]:
         for service in services
         if isinstance(service, dict) and service.get("type") == "ANPMessageService"
     ]
+
+
+def _check_peer_declared_message_service(service: dict[str, Any]) -> None:
+    """A peer-signed document is allowed to name its own message service.
+
+    With this on, nothing is compared against the values this server would have
+    chosen, so the endpoint and the service DID become the only caller-supplied
+    fields that reach a document this server then publishes under its own
+    authority. The check is deliberately shallow: it exists so the server never
+    publishes a malformed document, not to re-decide the peer's transport.
+
+    In particular https is NOT required here. Whether an endpoint is trustworthy,
+    and whether plaintext is acceptable, is the resolving side's call — the ANP
+    client already refuses plaintext to a host that is neither loopback nor
+    explicitly allowed, and a second, weaker copy of that rule on this side would
+    only be one more place for the two to disagree.
+    """
+    service_did = service.get("serviceDid")
+    if not isinstance(service_did, str) or not service_did.startswith("did:"):
+        raise InvalidParams("peer_declared_service_did_invalid", data={"actual": service_did})
+    endpoint = service.get("serviceEndpoint")
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise InvalidParams("peer_declared_service_endpoint_invalid", data={"actual": endpoint})
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise InvalidParams("peer_declared_service_endpoint_invalid", data={"actual": endpoint})
 
 
 def _normalize_domain(raw: Any) -> str:

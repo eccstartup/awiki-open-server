@@ -40,6 +40,29 @@ async def client(tmp_path):
 
 
 @pytest_asyncio.fixture
+async def peer_declared_service_client(tmp_path):
+    """A client whose server accepts an `ANPMessageService` the peer chose itself.
+
+    Everything else is the `client` fixture: the difference is the one setting, so a
+    failure here is about that setting rather than about the rest of the app.
+    """
+    app = create_app(
+        Settings(
+            data_dir=tmp_path,
+            public_base_url="http://testserver",
+            service_did="did:wba:testserver",
+            did_domain="testserver",
+            service_private_key_pem=generate_ed25519_private_key_pem(),
+            allow_unsigned_peer_dev=True,
+            allow_peer_declared_message_service=True,
+        )
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as async_client:
+        yield async_client
+
+
+@pytest_asyncio.fixture
 async def contact_verification_compat_client(tmp_path):
     app = create_app(
         Settings(
