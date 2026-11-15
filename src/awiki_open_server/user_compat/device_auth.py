@@ -35,15 +35,24 @@ class DeviceAccount:
     auth_generation: int = 1
 
 
-def device_account(did: str, manifest: SingleDeviceManifest) -> DeviceAccount:
+def device_account(did: str, manifest: SingleDeviceManifest, *, auth_generation: int = 1) -> DeviceAccount:
     return DeviceAccount(
         did=did, account_id=f"user-{hashlib.sha256(did.encode()).hexdigest()[:24]}",
         device_id=manifest.device_id, signing_key_id=manifest.signing_key_id,
         root_key_id=manifest.root_key_id, key_fingerprint=manifest.key_fingerprint,
+        auth_generation=auth_generation,
     )
 
 
 def bind_device_account(conn, account: DeviceAccount, *, create: bool = False) -> DeviceAccount:
+    """Check that the document-derived identity matches the stored one.
+
+    `auth_generation` is server-owned but recorded in two places: the account
+    row (what tokens bind to) and the active DID Document row (what the current
+    document authorizes). A root-authorized rebind advances both atomically, so
+    they agree. Any other difference means the registry was advanced out of
+    band and the device is fenced.
+    """
     if create:
         conn.execute(
             """INSERT OR IGNORE INTO single_device_accounts(
@@ -60,7 +69,51 @@ def bind_device_account(conn, account: DeviceAccount, *, create: bool = False) -
         ("key_fingerprint", account.key_fingerprint), ("auth_generation", account.auth_generation),
     )):
         raise Unauthorized("device_authorization_invalid")
-    return account
+    return stored_device_account(row)
+
+
+def stored_device_account(row) -> DeviceAccount:
+    return DeviceAccount(
+        did=str(row["owner_did"]), account_id=str(row["account_id"]),
+        device_id=str(row["device_id"]), signing_key_id=str(row["signing_key_id"]),
+        root_key_id=str(row["root_key_id"]), key_fingerprint=str(row["key_fingerprint"]),
+        auth_generation=int(row["auth_generation"]),
+    )
+
+
+def replace_device_account(conn, account: DeviceAccount) -> DeviceAccount:
+    """Replace the single device identity and advance its authorization generation.
+
+    Root-key rebind is the only caller: the previous generation's tokens stop
+    matching the row, so they can never be validated again.
+    """
+    row = conn.execute(
+        "SELECT auth_generation FROM single_device_accounts WHERE owner_did = ?", (account.did,),
+    ).fetchone()
+    generation = (int(row["auth_generation"]) if row else 0) + 1
+    if row is None:
+        conn.execute(
+            """INSERT INTO single_device_accounts(
+                owner_did, account_id, device_id, signing_key_id, root_key_id,
+                key_fingerprint, auth_generation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (account.did, account.account_id, account.device_id, account.signing_key_id,
+             account.root_key_id, account.key_fingerprint, generation),
+        )
+    else:
+        conn.execute(
+            """UPDATE single_device_accounts
+               SET account_id = ?, device_id = ?, signing_key_id = ?, root_key_id = ?,
+                   key_fingerprint = ?, auth_generation = ?
+               WHERE owner_did = ?""",
+            (account.account_id, account.device_id, account.signing_key_id, account.root_key_id,
+             account.key_fingerprint, generation, account.did),
+        )
+    return DeviceAccount(
+        did=account.did, account_id=account.account_id, device_id=account.device_id,
+        signing_key_id=account.signing_key_id, root_key_id=account.root_key_id,
+        key_fingerprint=account.key_fingerprint, auth_generation=generation,
+    )
 
 
 def consume_auth_nonce(conn, key_id: str, signature_metadata: dict[str, Any]) -> None:

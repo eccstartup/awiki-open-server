@@ -56,10 +56,22 @@ CREATE TABLE IF NOT EXISTS single_device_auth_nonces (
 );
 CREATE INDEX IF NOT EXISTS single_device_auth_nonces_expiry ON single_device_auth_nonces(expires_at);
 
+-- Idempotency ledger for root-authorized identity operations. A retried
+-- operation returns the committed result instead of applying twice.
+CREATE TABLE IF NOT EXISTS identity_operations (
+  operation_id TEXT PRIMARY KEY,
+  owner_did TEXT NOT NULL,
+  method TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS identity_operations_owner ON identity_operations(owner_did, method);
+
 CREATE TABLE IF NOT EXISTS did_documents (
   did TEXT PRIMARY KEY,
   document_json TEXT NOT NULL,
   document_version INTEGER NOT NULL DEFAULT 1,
+  auth_generation INTEGER NOT NULL DEFAULT 1,
   updated_at TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active',
   revoked_at TEXT
@@ -520,6 +532,7 @@ class Store:
             self.ensure_column(conn, "did_documents", "status", "TEXT NOT NULL DEFAULT 'active'")
             self.ensure_column(conn, "did_documents", "revoked_at", "TEXT")
             self.ensure_column(conn, "did_documents", "document_version", "INTEGER NOT NULL DEFAULT 1")
+            self.ensure_column(conn, "did_documents", "auth_generation", "INTEGER NOT NULL DEFAULT 1")
             self.ensure_column(conn, "users", "handle_binding_generation", "TEXT NOT NULL DEFAULT '1'")
             self.ensure_column(conn, "hosted_groups", "wire_profile", "TEXT NOT NULL DEFAULT 'anp.group.base.v1'")
             self.ensure_column(conn, "hosted_groups", "protocol_state", "TEXT NOT NULL DEFAULT 'active'")

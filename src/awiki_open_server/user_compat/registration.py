@@ -109,6 +109,18 @@ def server_info(request: Request) -> dict[str, Any]:
                 "methods": [{"id": "phone", "enabled": True, "verification": {"required": False, "type": "none"}}] if local else [],
             },
             "handle_recovery": {"enabled": False, "methods": []},
+            # Root-only recovery: the DID Document root key signs the request
+            # and the replacement single-device Manifest, so a holder of only
+            # the imported root credential can bind this machine to its DID.
+            "device_rebind": {
+                "enabled": local,
+                "methods": [] if not local else [{
+                    "id": "root_signature",
+                    "enabled": True,
+                    "verification": {"required": True, "type": "did_document_root_http_signature"},
+                }],
+                "purpose": "awiki.identity.device-rebind.v1",
+            },
         },
         "agents": {
             "skill_onboarding": {"enabled": False, "protocol_version": 1},

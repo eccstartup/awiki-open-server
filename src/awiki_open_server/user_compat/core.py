@@ -35,6 +35,7 @@ from awiki_open_server.service_identity import (
     _ed25519_public_key_from_multikey,
     verify_did_document_data_integrity_proof,
     verify_handle_ad_proof,
+    verify_object_proof,
 )
 from awiki_open_server.shared.errors import (
     Conflict,
@@ -48,7 +49,8 @@ from awiki_open_server.shared.ids import new_id, now_iso
 from awiki_open_server.shared import runtime
 from awiki_open_server.storage.db import Store
 from awiki_open_server.user_compat.device_auth import (
-    bind_device_account, consume_auth_nonce, device_account, issue_device_token, validate_device_token,
+    bind_device_account, consume_auth_nonce, device_account, issue_device_token,
+    replace_device_account, stored_device_account, validate_device_token,
 )
 from awiki_open_server.user_compat.registration import registration_check
 
@@ -94,6 +96,10 @@ def _validate_single_device_manifest(document: dict[str, Any]) -> SingleDeviceMa
                 exc.code, data={"max_devices_per_did": 1, "sync_mode": "single_device_pull_only"},
             ) from exc
         raise InvalidParams("device_manifest_invalid") from exc
+
+
+def _document_digest(document: dict[str, Any]) -> str:
+    return "sha256:" + base64.urlsafe_b64encode(hashlib.sha256(jcs.canonicalize(document)).digest()).decode().rstrip("=")
 
 
 def _is_past(value: Any) -> bool:
@@ -190,7 +196,7 @@ def did_for_token(request: Request, token: str) -> str | None:
     with get_store(request).connect() as conn:
         row = conn.execute(
             """
-            SELECT u.did, u.access_expires_at, d.document_json
+            SELECT u.did, u.access_expires_at, d.document_json, d.auth_generation
             FROM users u
             JOIN did_documents d ON d.did = u.did
             WHERE u.token = ?
@@ -206,7 +212,10 @@ def did_for_token(request: Request, token: str) -> str | None:
             try:
                 manifest = _validate_single_device_manifest(_load(row["document_json"]))
                 if manifest is not None:
-                    account = bind_device_account(conn, device_account(str(row["did"]), manifest))
+                    account = bind_device_account(
+                        conn,
+                        device_account(str(row["did"]), manifest, auth_generation=int(row["auth_generation"])),
+                    )
                     validate_device_token(token, account, request.app.state.auth_token_signing_key)
                     request.state.device_account = account
                 elif conn.execute("SELECT 1 FROM single_device_accounts WHERE owner_did = ?", (row["did"],)).fetchone():
@@ -253,7 +262,7 @@ def current_did(request: Request, *, required: bool = True) -> str | None:
             with get_store(request).connect() as conn:
                 row = conn.execute(
                     """
-                    SELECT d.document_json FROM did_documents d
+                    SELECT d.document_json, d.auth_generation FROM did_documents d
                     JOIN users u ON u.did = d.did
                     WHERE d.did = ? AND d.status = 'active' AND d.revoked_at IS NULL
                       AND u.revoked_at IS NULL
@@ -281,7 +290,9 @@ def current_did(request: Request, *, required: bool = True) -> str | None:
                 conn.execute("BEGIN IMMEDIATE")
                 consume_auth_nonce(conn, key_id, verification.metadata)
             if manifest is not None:
-                request.state.signed_device_account = device_account(did, manifest)
+                request.state.signed_device_account = device_account(
+                    did, manifest, auth_generation=int(row["auth_generation"]),
+                )
                 request.state.device_account = request.state.signed_device_account
             return did
         except (AnpProtocolError, ValueError, KeyError, json.JSONDecodeError) as exc:
@@ -289,6 +300,53 @@ def current_did(request: Request, *, required: bool = True) -> str | None:
     if required:
         raise Unauthorized("invalid_bearer_token" if token else "missing_authentication")
     return None
+
+
+def _root_signed_did_and_document(request: Request) -> tuple[str, dict[str, Any]]:
+    """Authenticate a rebind request with the DID Document's own root key.
+
+    `current_did` refuses root signatures whenever a Manifest exists, because a
+    root key must never become a device token principal. A rebind is the one
+    control-plane operation where the root key is the authority; it is kept on
+    its own path so no other handler inherits this acceptance.
+    """
+    headers = dict(request.headers)
+    if not headers.get("signature-input") or not headers.get("signature"):
+        raise Unauthorized("root_signature_required")
+    try:
+        key_id = signature_keyid(headers)
+    except AnpProtocolError as exc:
+        raise Unauthorized("invalid_http_signature") from exc
+    did = key_id.split("#", 1)[0]
+    with get_store(request).connect() as conn:
+        row = conn.execute(
+            "SELECT document_json FROM did_documents WHERE did = ? AND status = 'active' AND revoked_at IS NULL",
+            (did,),
+        ).fetchone()
+    if row is None:
+        raise Unauthorized("did_not_found")
+    document = _load(row["document_json"])
+    proof = document.get("proof") if isinstance(document.get("proof"), dict) else {}
+    if key_id != proof.get("verificationMethod"):
+        raise Unauthorized("root_signature_required")
+    raw_body = getattr(request.state, "raw_body", getattr(request, "_body", b""))
+    public_url = f"{get_settings(request).public_base_url.rstrip('/')}{request.url.path}"
+    if request.url.query:
+        public_url = f"{public_url}?{request.url.query}"
+    try:
+        verification = verify_service_http_signature(
+            did_document=document,
+            request_method=request.method,
+            request_url=public_url,
+            headers=headers,
+            body=raw_body,
+        )
+    except (AnpProtocolError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        raise Unauthorized("invalid_http_signature") from exc
+    with get_store(request).connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        consume_auth_nonce(conn, key_id, verification.metadata)
+    return did, document
 
 
 def did_document(settings: Settings, did: str, handle: str | None = None) -> dict[str, Any]:
@@ -487,7 +545,7 @@ def _rotate_tokens_for_did(request: Request, did: str) -> dict[str, Any]:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             """
-            SELECT u.did, d.document_json
+            SELECT u.did, d.document_json, d.auth_generation
             FROM users u
             JOIN did_documents d ON d.did = u.did
             WHERE u.did = ?
@@ -501,11 +559,11 @@ def _rotate_tokens_for_did(request: Request, did: str) -> dict[str, Any]:
             raise Unauthorized("did_not_found")
         manifest = _validate_single_device_manifest(_load(row["document_json"]))
         if manifest is not None:
-            account = device_account(did, manifest)
+            derived = device_account(did, manifest, auth_generation=int(row["auth_generation"]))
             signed_account = getattr(request.state, "signed_device_account", None)
-            if signed_account is not None and signed_account != account:
+            if signed_account is not None and signed_account != derived:
                 raise Unauthorized("device_authorization_invalid")
-            bind_device_account(conn, account, create=signed_account == account)
+            account = bind_device_account(conn, derived, create=signed_account == derived)
             access_token = issue_device_token(account, request.app.state.auth_token_signing_key, ACCESS_TOKEN_TTL_SECONDS)
         conn.execute(
             """
@@ -940,6 +998,13 @@ def _register_aggregate(
             (stored_handle, submitting_did, _json(ad), now_iso(), _json(dids)),
         )
         if account is not None:
+            stored = conn.execute(
+                "SELECT auth_generation FROM did_documents WHERE did = ?", (submitting_did,),
+            ).fetchone()
+            account = device_account(
+                submitting_did, manifest,
+                auth_generation=int(stored["auth_generation"]) if stored else 1,
+            )
             bind_device_account(conn, account, create=True)
 
     assert token is not None and refresh_token is not None
@@ -1002,13 +1067,14 @@ def update_document(params: dict[str, Any], request: Request) -> dict[str, Any]:
     with get_store(request).connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         old_row = conn.execute(
-            "SELECT document_json, document_version FROM did_documents WHERE did = ? AND status = 'active' AND revoked_at IS NULL",
+            "SELECT document_json, document_version, auth_generation FROM did_documents WHERE did = ? AND status = 'active' AND revoked_at IS NULL",
             (did,),
         ).fetchone()
         if old_row is None:
             raise Unauthorized("did_not_found")
         old_document = _load(old_row["document_json"])
         version = int(old_row["document_version"])
+        generation = int(old_row["auth_generation"])
         current_hash = "sha256:" + base64.urlsafe_b64encode(hashlib.sha256(jcs.canonicalize(old_document)).digest()).decode().rstrip("=")
         exact_cas = expected_hash == current_hash and expected_version == version
         if expected_version is not None:
@@ -1020,8 +1086,8 @@ def update_document(params: dict[str, Any], request: Request) -> dict[str, Any]:
         if (old_manifest is None) != (new_manifest is None):
             raise NotSupported("device_enrollment_or_removal_not_supported")
         if old_manifest is not None:
-            current = device_account(did, old_manifest)
-            if device_account(did, new_manifest) != current:
+            current = device_account(did, old_manifest, auth_generation=generation)
+            if device_account(did, new_manifest, auth_generation=generation) != current:
                 raise NotSupported("device_key_or_root_change_not_supported")
             bind_device_account(conn, current)
         elif isinstance(old_document.get("proof"), dict) and not settings.allow_unsigned_peer_dev:
@@ -1036,6 +1102,254 @@ def update_document(params: dict[str, Any], request: Request) -> dict[str, Any]:
             version += 1
             conn.execute("UPDATE did_documents SET document_json=?, document_version=?, updated_at=? WHERE did=?", (_json(document), version, now_iso(), did))
     return {"did": did, "document": document, "did_document": document, "document_version": version}
+
+
+DEVICE_REBIND_PURPOSE = "awiki.identity.device-rebind.v1"
+
+
+def _device_rebind_intent(
+    *, did: str, operation_id: str, document_digest: str, device_id: str, signing_key_id: str,
+) -> dict[str, Any]:
+    return {
+        "purpose": DEVICE_REBIND_PURPOSE,
+        "did": did,
+        "operationId": operation_id,
+        "documentHash": document_digest,
+        "deviceId": device_id,
+        "signingKeyId": signing_key_id,
+    }
+
+
+def _verify_new_device_possession(
+    proof: Any,
+    *,
+    did: str,
+    operation_id: str,
+    new_document: dict[str, Any],
+    manifest: SingleDeviceManifest,
+) -> None:
+    intent = _device_rebind_intent(
+        did=did,
+        operation_id=operation_id,
+        document_digest=_document_digest(new_document),
+        device_id=manifest.device_id,
+        signing_key_id=manifest.signing_key_id,
+    )
+    try:
+        verify_object_proof(
+            {**intent, "proof": proof},
+            issuer_did=did,
+            issuer_did_document=new_document,
+        )
+    except InvalidParams as exc:
+        raise InvalidParams("new_device_proof_invalid", data={"reason": exc.error_message}) from exc
+    if proof.get("verificationMethod") != manifest.signing_key_id:
+        raise InvalidParams("new_device_proof_invalid")
+
+
+def device_rebind(params: dict[str, Any], request: Request) -> dict[str, Any]:
+    """Replace every device of an existing DID with one new root-authorized device.
+
+    This is the recovery path for a caller that holds only the DID's root key:
+    the root signs the HTTP request and the replacement document, and the new
+    device proves possession of its signing key. `update_document` keeps its
+    invariant that a device token can never change the Manifest.
+    """
+    settings = get_settings(request)
+    did, old_document = _root_signed_did_and_document(request)
+    _validate_local_user_did(did, settings)
+    if params.get("did") not in (None, did):
+        raise InvalidParams("did_mismatch")
+    operation_id = params.get("operation_id")
+    if not isinstance(operation_id, str) or not operation_id.strip() or len(operation_id) > 200:
+        raise InvalidParams("operation_id_required")
+    operation_id = operation_id.strip()
+    with get_store(request).connect() as conn:
+        replay = conn.execute(
+            "SELECT owner_did, method, result_json FROM identity_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+    if replay is not None:
+        # Idempotent retry: the committed result is authoritative, so the retry
+        # is neither re-validated against the already-rebound document nor
+        # applied twice. Root authority was proven above.
+        if replay["owner_did"] != did or replay["method"] != "device_rebind":
+            raise Conflict("operation_replayed")
+        with get_store(request).connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            account_row = conn.execute(
+                "SELECT * FROM single_device_accounts WHERE owner_did = ?", (did,),
+            ).fetchone()
+            if account_row is None:
+                raise Conflict("operation_replayed")
+            access_token, refresh_token, access_expires_at, refresh_expires_at = _issue_rebind_tokens(
+                request, conn, did, stored_device_account(account_row),
+            )
+        result = _load(replay["result_json"])
+        result.update({
+            "token": access_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "Bearer",
+            "expires_in": ACCESS_TOKEN_TTL_SECONDS,
+            "expires_at": access_expires_at,
+            "refresh_expires_at": refresh_expires_at,
+            "replayed": True,
+        })
+        request.state.response_access_token = result["access_token"]
+        return result
+    expected_hash = params.get("expected_document_hash")
+    if not isinstance(expected_hash, str) or re.fullmatch(r"sha256:[A-Za-z0-9_-]{43}", expected_hash) is None:
+        raise InvalidParams("expected_document_hash_invalid")
+    # Version CAS values are optional: a fresh client that only resolves the DID
+    # Document can still state the exact document hash, but not server-internal
+    # counters. When supplied they are checked exactly.
+    expected_version = params.get("expected_document_version")
+    if expected_version is not None and (type(expected_version) is not int or not 1 <= expected_version < 9223372036854775807):
+        raise InvalidParams("expected_document_version_invalid")
+    expected_registry_version = params.get("expected_registry_version")
+    if expected_registry_version is not None and (type(expected_registry_version) is not int or not 0 <= expected_registry_version < 9223372036854775807):
+        raise InvalidParams("expected_registry_version_invalid")
+
+    new_document = params.get("new_document")
+    if not isinstance(new_document, dict):
+        raise InvalidParams("new_document_required")
+    if new_document.get("id") != did:
+        raise InvalidParams("new_document_id_mismatch")
+    if not isinstance(new_document.get("proof"), dict):
+        raise InvalidParams("new_document_proof_required")
+    new_document = _ensure_anp_message_service(new_document, settings, did)
+    old_proof = old_document.get("proof") if isinstance(old_document.get("proof"), dict) else {}
+    old_root_id = old_proof.get("verificationMethod")
+    if not isinstance(old_root_id, str) or new_document["proof"].get("verificationMethod") != old_root_id:
+        raise NotSupported("root_change_not_supported")
+    old_root = find_verification_method(old_document, old_root_id)
+    if old_root is None or find_verification_method(new_document, old_root_id) != old_root:
+        raise NotSupported("root_change_not_supported")
+
+    old_manifest = _validate_single_device_manifest(old_document)
+    new_manifest = _validate_single_device_manifest(new_document)
+    if new_manifest is None:
+        raise InvalidParams("new_document_device_manifest_required")
+    raw_devices = new_document.get("deviceManifest", {}).get("devices")
+    if not isinstance(raw_devices, list) or len(raw_devices) != 1 or not isinstance(raw_devices[0], dict):
+        raise InvalidParams("device_manifest_invalid")
+    new_device_entry = raw_devices[0]
+    new_device = params.get("new_device")
+    if not isinstance(new_device, dict):
+        raise InvalidParams("new_device_required")
+    if (
+        new_device.get("device_id") != new_manifest.device_id
+        or new_device.get("signing_key_id") != new_manifest.signing_key_id
+        or new_device.get("e2ee_key_id") != new_device_entry.get("e2ee_key_id")
+    ):
+        raise InvalidParams("new_device_manifest_mismatch")
+
+    replaced = params.get("replaced_device_ids")
+    expected_replaced = [old_manifest.device_id] if old_manifest is not None else []
+    if (
+        not isinstance(replaced, list)
+        or any(not isinstance(value, str) for value in replaced)
+        or sorted(replaced) != sorted(expected_replaced)
+    ):
+        raise InvalidParams("replaced_device_ids_mismatch", data={"expected": expected_replaced, "actual": replaced})
+
+    next_account = device_account(did, new_manifest)
+    if old_manifest is not None and next_account == device_account(did, old_manifest):
+        raise InvalidParams("device_rebind_unchanged")
+
+    _verify_new_device_possession(
+        params.get("new_device_object_proof"),
+        did=did,
+        operation_id=operation_id,
+        new_document=new_document,
+        manifest=new_manifest,
+    )
+
+    with get_store(request).connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        old_row = conn.execute(
+            """SELECT d.document_json, d.document_version, d.auth_generation
+               FROM did_documents d JOIN users u ON u.did = d.did
+               WHERE d.did = ? AND d.status = 'active' AND d.revoked_at IS NULL""",
+            (did,),
+        ).fetchone()
+        if old_row is None:
+            raise Unauthorized("did_not_found")
+        current_document = _load(old_row["document_json"])
+        version = int(old_row["document_version"])
+        if current_document != old_document or _document_digest(current_document) != expected_hash:
+            raise Conflict("document_digest_mismatch")
+        if expected_version is not None and version != expected_version:
+            raise Conflict("document_digest_mismatch")
+        account_row = conn.execute(
+            "SELECT auth_generation FROM single_device_accounts WHERE owner_did = ?", (did,),
+        ).fetchone()
+        current_generation = int(account_row["auth_generation"]) if account_row else 0
+        document_generation = int(old_row["auth_generation"])
+        if document_generation != current_generation:
+            raise Conflict("registry_version_mismatch")
+        if expected_registry_version is not None and current_generation != expected_registry_version:
+            raise Conflict("registry_version_mismatch")
+        if version >= 9223372036854775807:
+            raise Conflict("document_version_exhausted")
+        if current_generation + 1 >= 9223372036854775807:
+            raise Conflict("registry_version_exhausted")
+        account = replace_device_account(conn, next_account)
+        access_token, refresh_token, access_expires_at, refresh_expires_at = _issue_rebind_tokens(
+            request, conn, did, account,
+        )
+        document_version = version + 1
+        conn.execute(
+            "UPDATE did_documents SET document_json = ?, document_version = ?, auth_generation = ?, updated_at = ? WHERE did = ?",
+            (_json(new_document), document_version, account.auth_generation, now_iso(), did),
+        )
+        result = {
+            "did": did,
+            "document": new_document,
+            "did_document": new_document,
+            "document_version": document_version,
+            "registry_version": account.auth_generation,
+            "auth_generation": account.auth_generation,
+            "device_id": account.device_id,
+            "signing_key_id": account.signing_key_id,
+            "replaced_device_ids": list(expected_replaced),
+            "token": access_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "Bearer",
+            "expires_in": ACCESS_TOKEN_TTL_SECONDS,
+            "expires_at": access_expires_at,
+            "refresh_expires_at": refresh_expires_at,
+            "replayed": False,
+        }
+        stored = {
+            key: value for key, value in result.items()
+            if key not in {"token", "access_token", "refresh_token", "expires_in", "expires_at", "refresh_expires_at"}
+        }
+        conn.execute(
+            "INSERT INTO identity_operations(operation_id, owner_did, method, result_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (operation_id, did, "device_rebind", _json(stored), now_iso()),
+        )
+    request.state.response_access_token = result["access_token"]
+    return result
+
+
+def _issue_rebind_tokens(
+    request: Request, conn, did: str, account,
+) -> tuple[str, str, str, str]:
+    access_token = issue_device_token(account, request.app.state.auth_token_signing_key, ACCESS_TOKEN_TTL_SECONDS)
+    refresh_token = new_id("rtok")
+    access_expires_at = _future_iso(ACCESS_TOKEN_TTL_SECONDS)
+    refresh_expires_at = _future_iso(REFRESH_TOKEN_TTL_SECONDS)
+    # Rotate both bearer artifacts in the same transaction: the previous
+    # generation's access token stops matching `users.token`, and its refresh
+    # token can no longer mint a token for the new device.
+    conn.execute(
+        "UPDATE users SET token = ?, refresh_token = ?, access_expires_at = ?, refresh_expires_at = ? WHERE did = ?",
+        (access_token, refresh_token, access_expires_at, refresh_expires_at, did),
+    )
+    return access_token, refresh_token, access_expires_at, refresh_expires_at
 
 
 def revoke(_: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -2293,6 +2607,7 @@ IDENTITY_HANDLERS = {
     "register": register,
     "challenge": challenge,
     "update_document": update_document,
+    "device_rebind": device_rebind,
     "verify": verify,
     "verify_http_request": verify_http_request,
     "get_me": get_me,
